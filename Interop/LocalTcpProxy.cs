@@ -111,7 +111,6 @@ namespace OmniPoss.Interop
                 try
                 {
                     _ipv4Listener = new TcpListener(IPAddress.Loopback, port);
-                    // Socket reuse allows binding even if port is in TIME_WAIT state (critical for reloads)
                     _ipv4Listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                     _ipv4Listener.Start();
                     _ = AcceptConnectionsAsync(_ipv4Listener, AddressFamily.InterNetwork, _cancellationTokenSource.Token);
@@ -126,7 +125,6 @@ namespace OmniPoss.Interop
                 try
                 {
                     _ipv6Listener = new TcpListener(IPAddress.IPv6Loopback, port);
-                    // Socket reuse allows binding even if port is in TIME_WAIT state (critical for reloads)
                     _ipv6Listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                     _ipv6Listener.Start();
                     _ = AcceptConnectionsAsync(_ipv6Listener, AddressFamily.InterNetworkV6, _cancellationTokenSource.Token);
@@ -143,6 +141,8 @@ namespace OmniPoss.Interop
                     Log.Error("LocalTcpProxy: Failed to start any listener");
                     return false;
                 }
+
+                _ = PreWarmSocks5ConnectionAsync();
 
                 _isInitialized = true;
                 return true;
@@ -171,7 +171,6 @@ namespace OmniPoss.Interop
                     if (client == null)
                         continue;
 
-                    // Remote endpoint is actually the local endpoint of the original connection (kernel redirects to us)
                     var remoteEndPoint = (IPEndPoint?)client.Client.RemoteEndPoint;
                     if (remoteEndPoint == null)
                     {
@@ -196,6 +195,56 @@ namespace OmniPoss.Interop
                         Log.Error(ex, "LocalTcpProxy: Error accepting connection");
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Pre-warms the connection to SOCKS5 server by establishing a test connection.
+        /// </summary>
+        private async Task PreWarmSocks5ConnectionAsync()
+        {
+            try
+            {
+                if (_socks5Target == null)
+                    return;
+
+                using (var testClient = new TcpClient())
+                {
+                    var socket = testClient.Client;
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    socket.SendTimeout = 10000;
+                    socket.ReceiveTimeout = 10000;
+
+                    using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+                    {
+                        await testClient.ConnectAsync(_socks5Target.Address, _socks5Target.Port).WaitAsync(cts.Token);
+                    }
+
+                    var stream = testClient.GetStream();
+                    byte[] authRequest = string.IsNullOrEmpty(_socks5Username) 
+                        ? new byte[] { 0x05, 0x01, 0x00 } 
+                        : new byte[] { 0x05, 0x01, 0x02 };
+                    await stream.WriteAsync(authRequest);
+
+                    var authResponse = new byte[2];
+                    int totalRead = 0;
+                    using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
+                    {
+                        while (totalRead < 2)
+                        {
+                            int bytesRead = await stream.ReadAsync(authResponse.AsMemory(totalRead, 2 - totalRead), readCts.Token);
+                            if (bytesRead == 0) break;
+                            totalRead += bytesRead;
+                        }
+                    }
+
+                    Log.Debug("LocalTcpProxy: SOCKS5 connection pre-warmed successfully");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Debug(ex, "LocalTcpProxy: SOCKS5 pre-warming failed (non-critical)");
             }
         }
 
@@ -295,7 +344,7 @@ namespace OmniPoss.Interop
         private readonly ulong _id = id;
         private readonly TcpClient _client = client;
         private readonly AddressFamily _ipFamily = ipFamily;
-        private readonly IPEndPoint _remoteEndPoint = remoteEndPoint; // Original connection's local endpoint
+        private readonly IPEndPoint _remoteEndPoint = remoteEndPoint;
         private readonly IPEndPoint _socks5Target = socks5Target;
         private readonly string? _username = username;
         private readonly string? _password = password;
@@ -328,53 +377,84 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Get original destination from connection info map (stored before kernel redirect)
+                var clientSocket = _client.Client;
+                clientSocket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                clientSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                clientSocket.SendTimeout = 10000;
+                clientSocket.ReceiveTimeout = 10000;
+                
+                TcpClient? socks5Client = null;
+                NetworkStream? socks5Stream = null;
+                var connectTask = Task.Run(async () =>
+                {
+                    var client = new TcpClient();
+                    var socket = client.Client;
+                    socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                    socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    socket.SendTimeout = 10000;
+                    socket.ReceiveTimeout = 10000;
+                    
+                    using (var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                    {
+                        await client.ConnectAsync(_socks5Target.Address, _socks5Target.Port).WaitAsync(connectCts.Token);
+                    }
+                    var stream = client.GetStream();
+                    socks5Client = client;
+                    socks5Stream = stream;
+                });
+
                 if (!_proxy.GetRemoteAddress(_remoteEndPoint, out var connInfo))
                 {
                     Log.Warning("TcpProxyConnection {Id}: Could not find connection info for port {Port}", _id, _remoteEndPoint.Port);
+                    await connectTask;
+                    try { _socks5Client?.Close(); } catch { }
                     return;
                 }
 
-                // Extract original destination from connInfo
                 var originalDestination = ExtractOriginalDestination(connInfo);
                 if (originalDestination == null)
                 {
                     Log.Warning("TcpProxyConnection {Id}: Could not extract original destination", _id);
+                    await connectTask;
+                    try { _socks5Client?.Close(); } catch { }
                     return;
                 }
 
+                await connectTask;
+                _socks5Client = socks5Client ?? throw new InvalidOperationException("SOCKS5 connection failed");
+                _socks5Stream = socks5Stream ?? throw new InvalidOperationException("SOCKS5 stream creation failed");
 
-                // Connect to SOCKS5 server
-                _socks5Client = new TcpClient();
-                await _socks5Client.ConnectAsync(_socks5Target.Address, _socks5Target.Port);
-                _socks5Stream = _socks5Client.GetStream();
-
-                // Send SOCKS5 auth request
                 _state = Socks5State.Auth;
                 await SendAuthRequestAsync();
 
-                // Wait for auth response
                 var authResponse = new byte[2];
-                var bytesRead = await _socks5Stream.ReadAsync(authResponse, cancellationToken);
-                if (bytesRead < 2 || authResponse[0] != 0x05)
+                using (var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    Log.Warning("TcpProxyConnection {Id}: Invalid auth response", _id);
-                    return;
+                    readCts.CancelAfter(TimeSpan.FromSeconds(1));
+                    var bytesRead = await _socks5Stream.ReadAsync(authResponse, readCts.Token);
+                    if (bytesRead < 2 || authResponse[0] != 0x05)
+                    {
+                        Log.Warning("TcpProxyConnection {Id}: Invalid auth response", _id);
+                        return;
+                    }
                 }
 
                 var method = authResponse[1];
 
-                // Handle username/password auth if required
                 if (method == 0x02 && !string.IsNullOrEmpty(_username))
                 {
                     _state = Socks5State.AuthNegotiation;
                     await SendUsernamePasswordAuthAsync();
 
-                    bytesRead = await _socks5Stream.ReadAsync(authResponse, cancellationToken);
-                    if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
+                    using (var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                     {
-                        Log.Warning("TcpProxyConnection {Id}: Username/password auth failed", _id);
-                        return;
+                        readCts.CancelAfter(TimeSpan.FromSeconds(1));
+                        var bytesRead = await _socks5Stream.ReadAsync(authResponse, readCts.Token);
+                        if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
+                        {
+                            Log.Warning("TcpProxyConnection {Id}: Username/password auth failed", _id);
+                            return;
+                        }
                     }
                 }
                 else if (method != 0x00)
@@ -383,16 +463,18 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Send SOCKS5 CONNECT request with original destination
                 _state = Socks5State.Connect;
                 await SendConnectRequestAsync(originalDestination);
 
-                // Wait for CONNECT response
-                var connectResponse = await ReadConnectResponseAsync(cancellationToken);
-                if (!connectResponse)
+                using (var connectReadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    Log.Warning("TcpProxyConnection {Id}: CONNECT request failed", _id);
-                    return;
+                    connectReadCts.CancelAfter(TimeSpan.FromSeconds(2));
+                    var connectResponse = await ReadConnectResponseAsync(connectReadCts.Token);
+                    if (!connectResponse)
+                    {
+                        Log.Warning("TcpProxyConnection {Id}: CONNECT request failed", _id);
+                        return;
+                    }
                 }
 
                 // Start bidirectional data relay

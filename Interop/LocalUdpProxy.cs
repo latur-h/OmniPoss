@@ -93,20 +93,9 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Handle UDP receive callback from UdpProxyConnection when data arrives from relay endpoint.
-        /// Unwraps SOCKS5 header and posts to NetFilter.
         /// </summary>
         public void OnUdpReceive(ulong id, byte[] data, int length, IPEndPoint originalDestination)
         {
-            // This is called when data arrives from the SOCKS5 relay endpoint
-            // We need to post it back to NetFilter using nf_udpPostReceive
-            // But we need the connection ID and options - these should be stored in the connection
-
-            // For now, we'll need to integrate this with NetFilter's udpReceive callback
-            // The proper way is to have the connection store the original connection ID and options
-            // and use nf_udpPostReceive here
-
-            // TODO: Implement proper integration with NetFilter's nf_udpPostReceive
-            // This requires storing the original connection ID and options in UdpProxyConnection
         }
 
         public void Dispose()
@@ -175,12 +164,10 @@ namespace OmniPoss.Interop
 #pragma warning restore CS0414
 
         /// <summary>
-        /// Deep-copy UDP options from NetFilter's udpSend callback (matching WFP sample).
-        /// The options pointer is only valid during the callback, so we must deep-copy it.
+        /// Deep-copy UDP options from NetFilter's udpSend callback.
         /// </summary>
         public void StoreOptions(IntPtr options)
         {
-            // Free any previously stored options
             if (_storedOptions != IntPtr.Zero)
             {
                 Marshal.FreeHGlobal(_storedOptions);
@@ -190,17 +177,10 @@ namespace OmniPoss.Interop
 
             if (options != IntPtr.Zero)
             {
-                // Read the options structure to get the length
-                // NF_UDP_OPTIONS structure: flags (4 bytes) + optionsLength (4 bytes) + options[1] (variable)
                 int flags = Marshal.ReadInt32(options);
                 int optionsLength = Marshal.ReadInt32(options + 4);
-
-                // Calculate total size: sizeof(NF_UDP_OPTIONS) + optionsLength - 1
-                // sizeof(NF_UDP_OPTIONS) = 8 (flags + optionsLength) + 1 (options[1])
-                // But we need: 8 + optionsLength (since options[1] is variable)
                 int totalSize = 8 + Math.Max(0, optionsLength);
 
-                // Deep-copy the options structure (matching WFP sample UDP_CONTEXT)
                 _storedOptions = Marshal.AllocHGlobal(totalSize);
                 _storedOptionsLength = totalSize;
                 byte[] optionsBytes = new byte[totalSize];
@@ -211,15 +191,11 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Stores a copy of the original remote address from NetFilter callback.
-        /// Only stores once (on first call) to preserve the original destination.
         /// </summary>
-        /// <param name="originalRemoteAddress">Pointer to original remote address sockaddr structure.</param>
         public void StoreOriginalRemoteAddress(IntPtr originalRemoteAddress)
         {
             if (originalRemoteAddress != IntPtr.Zero && _originalRemoteAddressBytes == null)
             {
-                // Store a copy of the original remote address bytes (only store once, on first call)
-                // This matches the C implementation which uses param_2 (original remote address) when posting back
                 const int NF_MAX_ADDRESS_LENGTH = 28;
                 byte[] addrBytes = new byte[NF_MAX_ADDRESS_LENGTH];
                 Marshal.Copy(originalRemoteAddress, addrBytes, 0, NF_MAX_ADDRESS_LENGTH);
@@ -230,18 +206,13 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Initializes UDP proxy connection by establishing TCP control channel and performing SOCKS5 UDP ASSOCIATE.
         /// </summary>
-        /// <returns>True if initialization succeeded, false otherwise.</returns>
+        /// <returns>True if initialization started successfully, false otherwise.</returns>
         public bool Initialize()
         {
             try
             {
-                // Create TCP control connection
                 _tcpControlClient = new TcpClient();
-                _tcpControlClient.Connect(_socks5Target.Address, _socks5Target.Port);
-                _tcpControlStream = _tcpControlClient.GetStream();
-
-                // Start authentication and UDP ASSOCIATE process
-                _ = ProcessUdpAssociateAsync();
+                _ = InitializeAsync();
                 return true;
             }
             catch (Exception ex)
@@ -252,38 +223,69 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
+        /// Asynchronously establishes TCP control connection and starts SOCKS5 UDP ASSOCIATE handshake.
+        /// </summary>
+        private async Task InitializeAsync()
+        {
+            try
+            {
+                var socket = _tcpControlClient!.Client;
+                socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                socket.SendTimeout = 10000;
+                socket.ReceiveTimeout = 10000;
+                
+                using (var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+                {
+                    await _tcpControlClient.ConnectAsync(_socks5Target.Address, _socks5Target.Port).WaitAsync(connectCts.Token);
+                }
+                _tcpControlStream = _tcpControlClient.GetStream();
+
+                await ProcessUdpAssociateAsync();
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "UdpProxyConnection {Id}: Async initialization failed", _id);
+                _isConnected = false;
+            }
+        }
+
+        /// <summary>
         /// Processes SOCKS5 UDP ASSOCIATE handshake: auth, UDP ASSOCIATE request, and starts packet relay.
         /// </summary>
         private async Task ProcessUdpAssociateAsync()
         {
             try
             {
-                // Send auth request
                 _state = Socks5State.Auth;
                 await SendAuthRequestAsync();
 
-                // Wait for auth response
                 var authResponse = new byte[2];
-                var bytesRead = await _tcpControlStream!.ReadAsync(authResponse);
-                if (bytesRead < 2 || authResponse[0] != 0x05)
+                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
                 {
-                    Log.Warning("UdpProxyConnection {Id}: Invalid auth response", _id);
-                    return;
+                    var bytesRead = await _tcpControlStream!.ReadAsync(authResponse, readCts.Token);
+                    if (bytesRead < 2 || authResponse[0] != 0x05)
+                    {
+                        Log.Warning("UdpProxyConnection {Id}: Invalid auth response", _id);
+                        return;
+                    }
                 }
 
                 var method = authResponse[1];
 
-                // Handle username/password auth if required
                 if (method == 0x02 && !string.IsNullOrEmpty(_username))
                 {
                     _state = Socks5State.AuthNegotiation;
                     await SendUsernamePasswordAuthAsync();
 
-                    bytesRead = await _tcpControlStream.ReadAsync(authResponse);
-                    if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
+                    using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
                     {
-                        Log.Warning("UdpProxyConnection {Id}: Username/password auth failed", _id);
-                        return;
+                        var bytesRead = await _tcpControlStream.ReadAsync(authResponse, readCts.Token);
+                        if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
+                        {
+                            Log.Warning("UdpProxyConnection {Id}: Username/password auth failed", _id);
+                            return;
+                        }
                     }
                 }
                 else if (method != 0x00)
@@ -292,36 +294,39 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Send UDP ASSOCIATE request
                 _state = Socks5State.UdpAssociate;
                 await SendUdpAssociateRequestAsync();
 
-                // Wait for UDP ASSOCIATE response
-                var response = await ReadUdpAssociateResponseAsync();
-                if (response == null)
+                IPEndPoint? response;
+                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
                 {
-                    Log.Warning("UdpProxyConnection {Id}: UDP ASSOCIATE failed", _id);
-                    return;
+                    response = await ReadUdpAssociateResponseAsync(readCts.Token);
+                    if (response == null)
+                    {
+                        Log.Warning("UdpProxyConnection {Id}: UDP ASSOCIATE failed", _id);
+                        return;
+                    }
                 }
 
                 _udpRelayEndPoint = response;
                 _udpClient = new UdpClient();
-                // Bind to any available local port (required before ReceiveAsync)
+                
+                var udpSocket = _udpClient.Client;
+                udpSocket.SendTimeout = 10000;
+                udpSocket.ReceiveTimeout = 10000;
+                
                 _udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
                 _isConnected = true;
                 _state = Socks5State.Connected;
 
 
-                // Process pending packets
                 while (_pendingPackets.TryDequeue(out var packet))
                 {
                     Send(packet.Data, packet.Length, packet.RemoteEndPoint);
                 }
 
-                // Start receiving UDP packets
                 _ = ReceiveUdpPacketsAsync();
 
-                // Start buffer cleanup task (single task for all buffers)
                 lock (_cleanupLock)
                 {
                     if (_cleanupTask == null)
@@ -390,47 +395,40 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Reads SOCKS5 UDP ASSOCIATE response and extracts relay endpoint.
         /// </summary>
+        /// <param name="cancellationToken">Cancellation token for timeout handling.</param>
         /// <returns>Relay endpoint or null if response is invalid.</returns>
-        private async Task<IPEndPoint?> ReadUdpAssociateResponseAsync()
+        private async Task<IPEndPoint?> ReadUdpAssociateResponseAsync(CancellationToken cancellationToken)
         {
             var buffer = new byte[10];
-            var bytesRead = await _tcpControlStream!.ReadAsync(buffer);
+            var bytesRead = await _tcpControlStream!.ReadAsync(buffer, cancellationToken);
             if (bytesRead < 10 || buffer[0] != 0x05 || buffer[1] != 0x00)
             {
                 return null;
             }
 
             var addressType = buffer[3];
-            if (addressType == 0x01) // IPv4
+            if (addressType == 0x01)
             {
                 var ip = new IPAddress(new byte[] { buffer[4], buffer[5], buffer[6], buffer[7] });
                 var port = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(buffer, 8));
                 return new IPEndPoint(ip, port);
             }
-            // IPv6 not implemented yet
             return null;
         }
 
         /// <summary>
         /// Sends UDP packet to SOCKS5 relay wrapped in SOCKS5 UDP format.
-        /// Queues packet if connection is not yet established.
         /// </summary>
-        /// <param name="data">Packet data.</param>
-        /// <param name="length">Data length.</param>
-        /// <param name="remoteEndPoint">Original destination endpoint.</param>
-        /// <returns>True if packet was sent or queued successfully.</returns>
         public bool Send(byte[] data, int length, IPEndPoint remoteEndPoint)
         {
             if (!_isConnected || _udpClient == null || _udpRelayEndPoint == null)
             {
-                // Queue packet for later
                 _pendingPackets.Enqueue(new UdpPacket { Data = data, Length = length, RemoteEndPoint = remoteEndPoint });
                 return true;
             }
 
             try
             {
-                // Wrap in SOCKS5 UDP format
                 byte[] wrappedPacket;
                 if (remoteEndPoint.AddressFamily == AddressFamily.InterNetwork)
                 {
@@ -447,7 +445,6 @@ namespace OmniPoss.Interop
                 }
                 else
                 {
-                    // IPv6 not fully implemented
                     return false;
                 }
 
@@ -463,16 +460,9 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Placeholder for handling received UDP packets from NetFilter.
-        /// Currently not used - packets are received via ReceiveUdpPacketsAsync instead.
         /// </summary>
-        /// <param name="data">Packet data.</param>
-        /// <param name="length">Data length.</param>
-        /// <param name="remoteEndPoint">Remote endpoint.</param>
         public void HandleReceive(byte[] data, int length, IPEndPoint remoteEndPoint)
         {
-            // This will be called by NetFilter when data arrives
-            // We need to unwrap the SOCKS5 UDP header and forward to the application
-            // Implementation depends on how NetFilter calls this
         }
 
         /// <summary>
@@ -496,75 +486,60 @@ namespace OmniPoss.Interop
                         var receiveTask = _udpClient.ReceiveAsync();
                         var result = await receiveTask.WaitAsync(cts.Token);
 
-                        // Unwrap SOCKS5 UDP header
                         if (result.Buffer.Length < 4)
                             continue;
 
-                        // Check SOCKS5 UDP header: [RSV(2)][FRAG(1)][ATYP(1)][ADDR][PORT][DATA]
                         if (result.Buffer[0] != 0x00 || result.Buffer[1] != 0x00)
-                            continue; // Not a valid SOCKS5 UDP packet
+                            continue;
 
                         byte atyp = result.Buffer[3];
                         int headerSize;
                         IPEndPoint? originalDestination = null;
                         byte[]? remoteAddressBytes = null;
 
-                        if (atyp == 0x01 && result.Buffer.Length >= 10) // IPv4
+                        if (atyp == 0x01 && result.Buffer.Length >= 10)
                         {
                             headerSize = 10;
-                            // SOCKS5 UDP header: address and port are already in network byte order
-                            // Match WFP sample: use address/port directly (no conversion needed)
-                            uint address = BitConverter.ToUInt32(result.Buffer, 4); // Network byte order
-                            ushort port = BitConverter.ToUInt16(result.Buffer, 8); // Network byte order
+                            uint address = BitConverter.ToUInt32(result.Buffer, 4);
+                            ushort port = BitConverter.ToUInt16(result.Buffer, 8);
 
-                            // Convert to IPEndPoint for logging (host byte order)
                             var ipBytes = BitConverter.GetBytes(address);
-                            Array.Reverse(ipBytes); // Convert from network to host byte order
+                            Array.Reverse(ipBytes);
                             var ip = new IPAddress(ipBytes);
                             var portHost = (ushort)IPAddress.NetworkToHostOrder((short)port);
                             originalDestination = new IPEndPoint(ip, portHost);
 
-                            // Create sockaddr_in structure directly (matching WFP sample)
-                            // sockaddr_in: sin_family (2) + sin_port (2) + sin_addr (4) + sin_zero (8) = 16 bytes
                             remoteAddressBytes = new byte[16];
-                            remoteAddressBytes[0] = 2; // AF_INET
+                            remoteAddressBytes[0] = 2;
                             remoteAddressBytes[1] = 0;
-                            BitConverter.GetBytes(port).CopyTo(remoteAddressBytes, 2); // Network byte order
-                            BitConverter.GetBytes(address).CopyTo(remoteAddressBytes, 4); // Network byte order
-                            // sin_zero is already zero-initialized
+                            BitConverter.GetBytes(port).CopyTo(remoteAddressBytes, 2);
+                            BitConverter.GetBytes(address).CopyTo(remoteAddressBytes, 4);
                         }
-                        else if (atyp == 0x04 && result.Buffer.Length >= 22) // IPv6
+                        else if (atyp == 0x04 && result.Buffer.Length >= 22)
                         {
                             headerSize = 22;
-                            // SOCKS5 UDP header: address and port are already in network byte order
                             byte[] ipBytes = new byte[16];
                             Array.Copy(result.Buffer, 4, ipBytes, 0, 16);
-                            ushort port = BitConverter.ToUInt16(result.Buffer, 20); // Network byte order
+                            ushort port = BitConverter.ToUInt16(result.Buffer, 20);
 
-                            // Convert to IPEndPoint for logging (host byte order)
                             var ip = new IPAddress(ipBytes);
                             var portHost = (ushort)IPAddress.NetworkToHostOrder((short)port);
                             originalDestination = new IPEndPoint(ip, portHost);
 
-                            // Create sockaddr_in6 structure directly (matching WFP sample)
-                            // sockaddr_in6: sin6_family (2) + sin6_port (2) + sin6_flowinfo (4) + sin6_addr (16) + sin6_scope_id (4) = 28 bytes
                             remoteAddressBytes = new byte[28];
-                            remoteAddressBytes[0] = 23; // AF_INET6
+                            remoteAddressBytes[0] = 23;
                             remoteAddressBytes[1] = 0;
-                            BitConverter.GetBytes(port).CopyTo(remoteAddressBytes, 2); // Network byte order
-                            // sin6_flowinfo is already zero-initialized
-                            Array.Copy(ipBytes, 0, remoteAddressBytes, 8, 16); // IPv6 address
-                            // sin6_scope_id is already zero-initialized
+                            BitConverter.GetBytes(port).CopyTo(remoteAddressBytes, 2);
+                            Array.Copy(ipBytes, 0, remoteAddressBytes, 8, 16);
                         }
                         else
                         {
-                            continue; // Unsupported address type or packet too small
+                            continue;
                         }
 
                         if (originalDestination == null || remoteAddressBytes == null)
                             continue;
 
-                        // Extract data (after header)
                         int dataLength = result.Buffer.Length - headerSize;
                         if (dataLength <= 0)
                             continue;
@@ -572,26 +547,11 @@ namespace OmniPoss.Interop
                         byte[] data = new byte[dataLength];
                         Array.Copy(result.Buffer, headerSize, data, 0, dataLength);
 
-                        // Check if connection is still active before posting (avoid race condition)
-                        // Match C implementation: only check internal flag (like socket validity check in C)
-                        // NetFilter will reject invalid connection IDs, so we don't need dictionary check
                         if (!_isConnected)
                         {
                             continue;
                         }
 
-                        // Post unwrapped data back to NetFilter (like C++ sample does)
-                        // WFP sample uses address from SOCKS5 header (extracted from SOCKS5 UDP packet)
-                        // This is the address that NetFilter expects - it matches the original destination
-                        // The SOCKS5 header contains the original destination address/port
-                        if (remoteAddressBytes == null)
-                        {
-                            Log.Warning("UdpProxyConnection {Id}: No remote address available for posting", _id);
-                            continue;
-                        }
-
-                        // Allocate unmanaged memory and keep it until NetFilter processes it
-                        // NetFilter may copy asynchronously, so we need to keep buffers valid
                         IntPtr remoteAddrPtr = Marshal.AllocHGlobal(remoteAddressBytes.Length);
                         IntPtr dataPtr = Marshal.AllocHGlobal(dataLength);
                         try
@@ -599,13 +559,8 @@ namespace OmniPoss.Interop
                             Marshal.Copy(remoteAddressBytes, 0, remoteAddrPtr, remoteAddressBytes.Length);
                             Marshal.Copy(data, 0, dataPtr, dataLength);
 
-                            // Use deep-copied options (matching WFP sample)
-                            // The WFP sample uses stored options from UDP_CONTEXT when posting back
                             IntPtr optionsPtr = _storedOptions;
 
-                            // Double-check connection is still active (race condition protection)
-                            // Match C implementation: only check internal flag (socket validity equivalent)
-                            // Also verify connection still exists in parent's map (NetFilter might have closed it)
                             if (!_isConnected || (_proxy != null && !_proxy.HasConnection(_id)))
                             {
                                 Marshal.FreeHGlobal(remoteAddrPtr);
@@ -616,28 +571,20 @@ namespace OmniPoss.Interop
                             var status = NativeNetFilterApi.nf_udpPostReceive(_id, remoteAddrPtr, dataPtr, dataLength, optionsPtr);
                             if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
                             {
-                                // Enqueue buffer for delayed cleanup (single cleanup task handles all buffers)
-                                // NetFilter should copy the data, but we'll keep buffers alive briefly to be safe
                                 _pendingBuffers.Enqueue((remoteAddrPtr, dataPtr));
-
-                                // Don't free immediately - let the cleanup task handle it
                                 remoteAddrPtr = IntPtr.Zero;
                                 dataPtr = IntPtr.Zero;
                             }
                             else
                             {
-                                // Match C implementation: NetFilter will reject invalid connection IDs
-                                // This is expected if connection was closed
                                 if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_INVALID_ENDPOINT_ID)
                                 {
-                                    _isConnected = false; // Mark as closed to stop further attempts
+                                    _isConnected = false;
                                 }
                                 else if (_isConnected)
                                 {
-                                    // Unexpected failure - log as warning
                                     Log.Warning("UdpProxyConnection {Id}: nf_udpPostReceive failed with status {Status}", _id, status);
                                 }
-                                // Free on failure
                                 Marshal.FreeHGlobal(remoteAddrPtr);
                                 Marshal.FreeHGlobal(dataPtr);
                             }
@@ -645,7 +592,6 @@ namespace OmniPoss.Interop
                         catch (Exception ex)
                         {
                             Log.Error(ex, "UdpProxyConnection {Id}: Error posting data to NetFilter", _id);
-                            // Free on error
                             if (remoteAddrPtr != IntPtr.Zero) Marshal.FreeHGlobal(remoteAddrPtr);
                             if (dataPtr != IntPtr.Zero) Marshal.FreeHGlobal(dataPtr);
                         }
@@ -674,11 +620,10 @@ namespace OmniPoss.Interop
             catch (Exception ex) when (ex is ObjectDisposedException ||
                                        (ex is SocketException se && (se.SocketErrorCode == SocketError.OperationAborted || se.SocketErrorCode == SocketError.Interrupted)))
             {
-                // Expected exceptions when connection is closed - don't log as error
             }
             catch (Exception ex)
             {
-                if (_isConnected) // Only log if we weren't intentionally shutting down
+                if (_isConnected)
                 {
                     Log.Error(ex, "UdpProxyConnection {Id}: Error receiving UDP packets", _id);
                 }
@@ -687,7 +632,6 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Background task that cleans up pending buffers after NetFilter has processed them.
-        /// Processes buffers sequentially to avoid race conditions.
         /// </summary>
         private async Task CleanupBuffersAsync()
         {
@@ -695,9 +639,8 @@ namespace OmniPoss.Interop
             {
                 while (_isConnected && !_receiveCancellation.Token.IsCancellationRequested)
                 {
-                    await Task.Delay(500, _receiveCancellation.Token); // Wait for NetFilter to process
+                    await Task.Delay(500, _receiveCancellation.Token);
 
-                    // Process one buffer at a time (sequential cleanup)
                     if (_pendingBuffers.TryDequeue(out var buffer))
                     {
                         try
@@ -714,7 +657,6 @@ namespace OmniPoss.Interop
             }
             catch (OperationCanceledException)
             {
-                // Expected when connection is closed
             }
             catch (Exception ex)
             {
@@ -727,7 +669,6 @@ namespace OmniPoss.Interop
             _isConnected = false;
             _receiveCancellation.Cancel();
 
-            // Wait for cleanup task to finish (with timeout)
             try
             {
                 _cleanupTask?.Wait(TimeSpan.FromSeconds(1));
@@ -738,7 +679,6 @@ namespace OmniPoss.Interop
             try { _tcpControlClient?.Close(); } catch { }
             try { _udpClient?.Close(); } catch { }
 
-            // Clean up any remaining pending buffers
             while (_pendingBuffers.TryDequeue(out var buffer))
             {
                 try
@@ -749,7 +689,6 @@ namespace OmniPoss.Interop
                 catch { }
             }
 
-            // Free deep-copied options (matching WFP sample UDP_CONTEXT destructor)
             if (_storedOptions != IntPtr.Zero)
             {
                 try

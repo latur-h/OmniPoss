@@ -31,7 +31,6 @@
   </ItemGroup>
 
   <!-- Copy native dependencies from Storage/v2.0 to bin/ folder in output -->
-  <!-- Using NetFilterSDK v2.0 native API (nfapi.dll) directly - no Redirector.bin needed -->
   <ItemGroup>
     <None Include="Storage\v2.0\nfapi.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

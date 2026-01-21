@@ -87,6 +87,7 @@ OmniPoss follows a **"SOCKS5-only frontend, core-agnostic backend"** pattern:
 
 ```json
 {
+  "AutoStart": true,
   "Cores": [
     {
       "Key": "sing-box",
@@ -200,6 +201,7 @@ Network filter configuration:
 3. **Configure OmniPoss** (`data/configs.json`):
 ```json
 {
+  "AutoStart": true,
   "Cores": [
     {
       "Key": "sing-box",
