@@ -23,9 +23,6 @@ namespace OmniPoss.UI
         private const int WM_ENDSESSION = 0x0016;
         private const uint ENDSESSION_LOGOFF = 0x80000000;
 
-        // Maximum time to wait for cleanup (60 seconds as Windows allows up to a minute)
-        private static readonly TimeSpan MaxShutdownWaitTime = TimeSpan.FromSeconds(60);
-
         public ShutdownHandlerForm(Func<Task> onShutdownRequested, ILogger<ShutdownHandlerForm>? logger = null)
         {
             _onShutdownRequested = onShutdownRequested ?? throw new ArgumentNullException(nameof(onShutdownRequested));
@@ -244,21 +241,14 @@ namespace OmniPoss.UI
                         return;
                     }
 
-                    // Session is ending - ensure cleanup is complete
+                    // Session is ending - check cleanup status
                     lock (_shutdownLock)
                     {
                         if (_shutdownTask != null && !_cleanupComplete)
                         {
-                            // Cleanup was started but not complete, wait for it
-                            _logger?.LogInformation("Waiting for cleanup to complete in WM_ENDSESSION...");
-
-                            DateTime startTime = DateTime.UtcNow;
-                            while (!_shutdownTask.IsCompleted && !_cleanupComplete && (DateTime.UtcNow - startTime) < MaxShutdownWaitTime)
-                            {
-                                Application.DoEvents();
-                                System.Threading.Thread.Sleep(10);
-                            }
-
+                            // Cleanup was started but not complete
+                            // Since we're in WM_ENDSESSION, Windows is forcing shutdown
+                            // Just check if it's done, don't wait
                             if (_shutdownTask.IsCompleted)
                             {
                                 try
@@ -272,11 +262,16 @@ namespace OmniPoss.UI
                                     _logger?.LogError(ex, "Shutdown task completed with exception");
                                 }
                             }
+                            else
+                            {
+                                // Task still running - log warning but don't block
+                                _logger?.LogWarning("Cleanup task still running in WM_ENDSESSION - Windows will terminate");
+                            }
                         }
                         else if (!_cleanupComplete && !_shutdownHandled)
                         {
-                            // Cleanup wasn't started, do it now (fallback case)
-                            _logger?.LogWarning("Cleanup not started, performing cleanup now in WM_ENDSESSION");
+                            // Fallback: cleanup wasn't started (shouldn't happen)
+                            _logger?.LogWarning("Cleanup not started in WM_ENDSESSION - starting now");
                             try
                             {
                                 NativeMethods.ShutdownBlockReasonCreate(
@@ -293,32 +288,23 @@ namespace OmniPoss.UI
                                     catch (Exception ex)
                                     {
                                         _logger?.LogError(ex, "Error during graceful shutdown");
-                                        throw;
+                                    }
+                                    finally
+                                    {
+                                        lock (_shutdownLock)
+                                        {
+                                            _cleanupComplete = true;
+                                        }
+                                        try
+                                        {
+                                            NativeMethods.ShutdownBlockReasonDestroy(this.Handle);
+                                        }
+                                        catch { }
                                     }
                                 });
-
-                                DateTime startTime = DateTime.UtcNow;
-                                while (!_shutdownTask.IsCompleted && (DateTime.UtcNow - startTime) < MaxShutdownWaitTime)
-                                {
-                                    Application.DoEvents();
-                                    System.Threading.Thread.Sleep(10);
-                                }
-
-                                if (_shutdownTask.IsCompleted)
-                                {
-                                    try
-                                    {
-#pragma warning disable VSTHRD002 // Avoid problematic synchronous waits
-                                        _shutdownTask.GetAwaiter().GetResult();
-#pragma warning restore VSTHRD002
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        _logger?.LogError(ex, "Shutdown task completed with exception");
-                                    }
-                                }
-
-                                NativeMethods.ShutdownBlockReasonDestroy(this.Handle);
+                                
+                                // Don't wait - just start it and let it complete in background
+                                // Windows will wait based on ShutdownBlockReasonCreate
                             }
                             catch (Exception ex)
                             {
