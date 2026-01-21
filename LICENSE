@@ -1,0 +1,66 @@
+MIT License
+
+Copyright (c) 2024 NetFilter Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+## Third-Party Components
+
+This software includes components from NetFilterSDK, which are proprietary and
+subject to their own license terms. The MIT License above applies only to the
+NetFilter project's own source code, not to NetFilterSDK components.
+
+### NetFilterSDK Components
+
+The following files are part of NetFilterSDK and are NOT covered by this MIT
+License:
+
+- `Storage/nfapi.dll` - Native API library
+- `Storage/nfdriver.sys` - Kernel-mode network filter driver
+- `Storage/Redirector.bin` - Redirector native library
+
+These components are proprietary software owned by Vitaly Sidorov and are
+distributed under NetFilterSDK's license terms. For information about
+NetFilterSDK licensing, please visit: https://www.netfiltersdk.com/
+
+### NetFilterSDK License Compliance
+
+When using or distributing this software:
+
+1. The NetFilterSDK components (nfapi.dll, nfdriver.sys, Redirector.bin) are
+   provided in binary form only and are subject to NetFilterSDK's proprietary
+   license terms.
+
+2. You may distribute compiled binaries of this software that include
+   NetFilterSDK components, provided that:
+   - Your distribution complies with NetFilterSDK's license terms
+   - You do not distribute NetFilterSDK source code or modified source code
+   - You include appropriate copyright notices for NetFilterSDK
+
+3. If you wish to distribute source code derived from or including NetFilterSDK
+   components, you must ensure that recipients have obtained their own
+   NetFilterSDK license under the same terms.
+
+4. The NetFilter project's own source code (excluding NetFilterSDK components)
+   remains licensed under the MIT License as stated above.
+
+For questions about NetFilterSDK licensing, please contact the NetFilterSDK
+author or visit the official NetFilterSDK website.
