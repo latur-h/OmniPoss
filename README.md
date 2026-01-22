@@ -348,14 +348,16 @@ dotnet build -c Release
   - `CoreConfig.cs`: Core process definition
 - `Infrastructure/`: Platform-specific code
   - `Drivers/NetworkFilterDriver.cs`: Driver installation and management
-  - `Interop/Redirector.cs`: Pure C# implementation for driver control (uses nfapi.dll directly)
+  - `Interop/NativeNetFilterApi.cs`: P/Invoke declarations for nfapi.dll
   - `Process/CoreProcessManager.cs`: Process lifecycle management
+  - `ServiceCollectionExtensions.cs`: DI service registration
 - `Services/`: Service layer
   - `Socks5ClientService.cs`: SOCKS5 client wrapper
   - `ProxyService.cs`: Windows registry-based proxy configuration
-- `Interop/`: Network proxy implementations
+- `Interop/`: Network proxy implementations and driver control
   - `LocalTcpProxy.cs`: Local TCP proxy server (SOCKS5, configurable port, default 8888)
   - `LocalUdpProxy.cs`: Local UDP proxy handler (SOCKS5 UDP ASSOCIATE)
+  - `Redirector.cs`: Pure C# implementation for driver control (uses nfapi.dll directly)
   - `ConsoleManager.cs`: Console window show/hide management
 - `UI/`: User interface components
   - `Tray/TrayMenu.cs`: Context menu creation and state management
@@ -436,7 +438,7 @@ dotnet build -c Release
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-**Important**: This project includes NetFilterSDK components (nfapi.dll, nfdriver.sys, Redirector.bin) which are proprietary and subject to their own license terms. The MIT License applies only to the OmniPoss project's own source code, not to NetFilterSDK components. See the [LICENSE](LICENSE) file for complete details and NetFilterSDK licensing information.
+**Important**: This project includes NetFilterSDK components (nfapi.dll, nfdriver.sys, nfregdrv.exe) which are proprietary and subject to their own license terms. The MIT License applies only to the OmniPoss project's own source code, not to NetFilterSDK components. See the [LICENSE](LICENSE) file for complete details and NetFilterSDK licensing information.
 
 ## 🙏 Acknowledgments
 
