@@ -24,6 +24,9 @@ namespace OmniPoss.Interop
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
 
+        /// <summary>
+        /// Initializes the console window if it doesn't exist.
+        /// </summary>
         public static void InitConsole()
         {
             IntPtr handle = GetConsoleWindow();
@@ -34,6 +37,9 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Shows the console window.
+        /// </summary>
         public static void Show()
         {
             IntPtr handle = GetConsoleWindow();
@@ -49,6 +55,9 @@ namespace OmniPoss.Interop
             IsEnabled = true;
         }
 
+        /// <summary>
+        /// Hides the console window.
+        /// </summary>
         public static void Hide()
         {
             IntPtr handle = GetConsoleWindow();
@@ -60,6 +69,9 @@ namespace OmniPoss.Interop
             IsEnabled = false;
         }
 
+        /// <summary>
+        /// Closes and frees the console window.
+        /// </summary>
         public static void Close()
         {
             FreeConsole();

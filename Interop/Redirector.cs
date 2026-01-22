@@ -26,37 +26,34 @@ namespace OmniPoss.Interop
         private static int _targetPort;
         private static string? _targetUser;
         private static string? _targetPass;
-        private static uint _localProxyProcessId = 0; // Process ID of local SOCKS5 proxy (e.g., sing-box)
+        private static uint _localProxyProcessId = 0;
         private static bool _isInitialized = false;
         private static IntPtr _eventHandlerPtr = IntPtr.Zero;
         private static IntPtr _ipEventHandlerPtr = IntPtr.Zero;
 
-        // Configuration flags (from Redirector.bin aio_dial)
-        private static bool _filterLoopback = false; // AIO_FILTERLOOPBACK
-        private static bool _filterIntranet = true; // AIO_FILTERINTRANET (default: true, filter intranet)
-        private static bool _filterParent = false; // AIO_FILTERPARENT
-        private static bool _filterICMP = false; // AIO_FILTERICMP
-        private static bool _filterTCP = true; // AIO_FILTERTCP (default: true)
-        private static bool _filterUDP = true; // AIO_FILTERUDP (default: true)
-        private static bool _filterDNS = false; // AIO_FILTERDNS
-        private static bool _dnsOnly = false; // AIO_DNSONLY
-        private static bool _dnsProxy = false; // AIO_DNSPROX
-        private static string? _dnsHost; // AIO_DNSHOST
-        private static ushort _dnsPort = 53; // AIO_DNSPORT (default: 53)
-        private static int _icmpDelay = 0; // AIO_ICMPING
+        private static bool _filterLoopback = false;
+        private static bool _filterIntranet = true;
+        private static bool _filterParent = false;
+        private static bool _filterICMP = false;
+        private static bool _filterTCP = true;
+        private static bool _filterUDP = true;
+        private static bool _filterDNS = false;
+        private static bool _dnsOnly = false;
+        private static bool _dnsProxy = false;
+        private static string? _dnsHost;
+        private static ushort _dnsPort = 53;
+        private static int _icmpDelay = 0;
 
-        // Statistics tracking (from Redirector.bin aio_getUP/aio_getDL)
         private static long _uploadBytes = 0;
         private static long _downloadBytes = 0;
         private static readonly object _statsLock = new();
 
-        // Local proxy servers (SocksRedirector pattern)
         private static LocalTcpProxy? _tcpProxy;
         private static LocalUdpProxy? _udpProxy;
-        private static ushort _localProxyPort = 8888; // Default local proxy port
+        private static ushort _localProxyPort = 8888;
 
         private static readonly List<Delegate> _callbackDelegates = new();
-        private static readonly List<GCHandle> _callbackHandles = new(); // Keep delegates alive in release mode
+        private static readonly List<GCHandle> _callbackHandles = new();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void ThreadStartCallback();
 
@@ -105,14 +102,12 @@ namespace OmniPoss.Interop
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void UdpCanSendCallback(ulong id);
 
-        // IP/ICMP event handler delegates
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void IpReceiveCallback(IntPtr buf, int len, IntPtr options);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void IpSendCallback(IntPtr buf, int len, IntPtr options);
 
-        // ICMP delay tracking
         private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _icmpPacketTimes = new();
         private static readonly object _icmpDelayLock = new();
 
@@ -134,7 +129,6 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Skip filtering for parent process if FilterParent is enabled
                 if (_filterParent && pConnInfo.processId == Environment.ProcessId)
                 {
                     return;
@@ -143,7 +137,7 @@ namespace OmniPoss.Interop
                 var processName = GetProcessName(pConnInfo.processId);
                 var processId = pConnInfo.processId;
                 var ipFamily = pConnInfo.ip_family;
-                
+
                 QueueLog(() => Log.Information("[TCP] Connection intercepted: ID={ConnectionId}, Process={ProcessName} (PID={ProcessId}), IPFamily={IpFamily}",
                     id, processName, processId, ipFamily));
 
@@ -295,25 +289,21 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // FilterParent: Skip filtering for parent process (current process ID)
                 if (_filterParent && pConnInfo.processId == Environment.ProcessId)
                 {
                     var processId = pConnInfo.processId;
                     QueueLog(() => Log.Debug("[UDP] Bypassing parent process: Connection {ConnectionId}, PID={ProcessId}", id, processId));
-                    return; // Don't redirect - rules should handle this, but return early for safety
+                    return;
                 }
 
-                // Runtime process name matching (like FUN_1800038d0 and FUN_180003ac0 in Redirector.bin)
-                // Check bypass patterns first
                 if (CheckBypassName(pConnInfo.processId))
                 {
-                    return; // Don't redirect - rules should handle this, but return early for safety
+                    return;
                 }
 
-                // Check handle patterns (if FilterUDP is enabled)
                 if (_filterUDP && !CheckHandleName(pConnInfo.processId))
                 {
-                    return; // Don't redirect - rules should handle this, but return early for safety
+                    return;
                 }
             }
             catch (Exception ex)
@@ -372,7 +362,6 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Extract remote endpoint
                 byte[] remoteAddrBytes = new byte[NF_MAX_ADDRESS_LENGTH];
                 Marshal.Copy(remoteAddress, remoteAddrBytes, 0, Math.Min(NF_MAX_ADDRESS_LENGTH, remoteAddrBytes.Length));
 
@@ -396,7 +385,6 @@ namespace OmniPoss.Interop
                     remoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), remotePort);
                 }
 
-                // DNS special handling: proxy or bypass based on DNSProxy setting
                 if (remotePort == 53 && _filterDNS)
                 {
                     if (_dnsProxy && _udpProxy != null && remoteEndPoint != null)
@@ -434,7 +422,6 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Bypass private addresses
                 if (IsPrivateAddress(remoteEndPoint.Address))
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
@@ -445,7 +432,6 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Route through LocalUdpProxy (SOCKS5 UDP ASSOCIATE)
                 if (_udpProxy != null)
                 {
                     byte[] data = new byte[len];
@@ -461,7 +447,6 @@ namespace OmniPoss.Interop
                     }
                 }
 
-                // Fallback: direct send if proxy fails
                 QueueLog(() => Log.Warning("[UDP] Proxy send failed, allowing direct send: Connection {ConnectionId}", id));
                 NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                 lock (_statsLock)
@@ -505,17 +490,14 @@ namespace OmniPoss.Interop
         {
             try
             {
-                if (!_filterICMP || len < 20) // Minimum IP header size
+                if (!_filterICMP || len < 20)
                     return;
 
-                // Parse IP header to check if it's ICMP
                 byte[] ipHeader = new byte[Math.Min(20, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
-                // Check protocol field (byte 9 in IP header)
                 if (ipHeader.Length >= 10 && ipHeader[9] == IPPROTO_ICMP)
                 {
-                    // Extract source and destination IPs for delay tracking
                     string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
 
                     if (_icmpDelay > 0)
@@ -527,7 +509,6 @@ namespace OmniPoss.Interop
                                 var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
                                 if (elapsed < _icmpDelay)
                                 {
-                                    // Delay not met yet - drop packet
                                     return;
                                 }
                             }
@@ -535,14 +516,12 @@ namespace OmniPoss.Interop
                         }
                     }
 
-                    // Track download statistics
                     lock (_statsLock)
                     {
                         _downloadBytes += len;
                     }
                 }
 
-                // Post the packet back to the stack
                 NativeNetFilterApi.nf_ipPostReceive(buf, len, options);
             }
             catch (Exception ex)
@@ -561,17 +540,14 @@ namespace OmniPoss.Interop
         {
             try
             {
-                if (!_filterICMP || len < 20) // Minimum IP header size
+                if (!_filterICMP || len < 20)
                     return;
 
-                // Parse IP header to check if it's ICMP
                 byte[] ipHeader = new byte[Math.Min(20, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
-                // Check protocol field (byte 9 in IP header)
                 if (ipHeader.Length >= 10 && ipHeader[9] == IPPROTO_ICMP)
                 {
-                    // Extract source and destination IPs for delay tracking
                     string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
 
                     if (_icmpDelay > 0)
@@ -583,7 +559,6 @@ namespace OmniPoss.Interop
                                 var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
                                 if (elapsed < _icmpDelay)
                                 {
-                                    // Delay not met yet - drop packet
                                     return;
                                 }
                             }
@@ -591,14 +566,12 @@ namespace OmniPoss.Interop
                         }
                     }
 
-                    // Track upload statistics
                     lock (_statsLock)
                     {
                         _uploadBytes += len;
                     }
                 }
 
-                // Post the packet to the network
                 NativeNetFilterApi.nf_ipPostSend(buf, len, options);
             }
             catch (Exception ex)
@@ -619,7 +592,7 @@ namespace OmniPoss.Interop
         private static readonly ConcurrentDictionary<uint, ProcessInfo> _processCache = new();
         private static readonly TimeSpan _processCacheTTL = TimeSpan.FromMinutes(5);
         private static readonly object _processCacheLock = new();
-        private static GCHandle _processCacheHandle; // Keep cache alive in release mode
+        private static GCHandle _processCacheHandle;
 
         private struct PatternMatchResult
         {
@@ -630,7 +603,7 @@ namespace OmniPoss.Interop
 
         private static readonly ConcurrentDictionary<uint, PatternMatchResult> _patternMatchCache = new();
         private static readonly TimeSpan _patternCacheTTL = TimeSpan.FromMinutes(5);
-        private static GCHandle _patternCacheHandle; // Keep cache alive in release mode
+        private static GCHandle _patternCacheHandle;
 
         private static readonly ConcurrentQueue<Action> _logQueue = new();
         private static readonly CancellationTokenSource _logQueueCts = new();
@@ -659,7 +632,7 @@ namespace OmniPoss.Interop
             {
                 var process = Process.GetProcessById((int)processId);
                 var processName = process.ProcessName;
-                
+
                 string? processPath = null;
                 try
                 {
@@ -727,7 +700,7 @@ namespace OmniPoss.Interop
                 var process = Process.GetProcessById((int)processId);
                 string? processPath = null;
                 string processName = process.ProcessName;
-                
+
                 try
                 {
                     processPath = process.MainModule?.FileName;
@@ -873,23 +846,17 @@ namespace OmniPoss.Interop
             if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(pattern))
                 return false;
 
-            // Convert to case-insensitive comparison
             text = text.ToLowerInvariant();
             pattern = pattern.ToLowerInvariant();
 
-            // Normalize .exe extension: Process.ProcessName doesn't include .exe extension
-            // If pattern ends with .exe but text doesn't, remove .exe from pattern for comparison
             if (pattern.EndsWith(".exe") && !text.EndsWith(".exe"))
             {
-                pattern = pattern.Substring(0, pattern.Length - 4); // Remove .exe
+                pattern = pattern.Substring(0, pattern.Length - 4);
             }
-            // If text has .exe but pattern doesn't, remove .exe from text for comparison
             else if (text.EndsWith(".exe") && !pattern.EndsWith(".exe"))
             {
-                text = text.Substring(0, text.Length - 4); // Remove .exe
+                text = text.Substring(0, text.Length - 4);
             }
-
-            // Simple wildcard implementation
             int textIndex = 0;
             int patternIndex = 0;
             int textStar = -1;
@@ -953,7 +920,6 @@ namespace OmniPoss.Interop
             return "Unknown";
         }
 
-        // Constants
         private const int IPPROTO_TCP = 6;
         private const int IPPROTO_UDP = 17;
         private const int IPPROTO_ICMP = 1;
@@ -963,6 +929,8 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Checks if an IP address is a private/local network address that should bypass the proxy.
         /// </summary>
+        /// <param name="address">IP address to check.</param>
+        /// <returns>True if the address is private and should bypass the proxy.</returns>
         private static bool IsPrivateAddress(IPAddress address)
         {
             if (address.AddressFamily == AddressFamily.InterNetwork)
@@ -1001,7 +969,6 @@ namespace OmniPoss.Interop
         private const int AF_INET = 2;
         private const int AF_INET6 = 23;
 
-        // SOCKS5 protocol constants
         private const byte SOCKS5_VERSION = 0x05;
         private const byte SOCKS5_CMD_CONNECT = 0x01;
         private const byte SOCKS5_CMD_UDP_ASSOCIATE = 0x03;
@@ -1027,18 +994,30 @@ namespace OmniPoss.Interop
             AIO_TGTPORT,
             AIO_TGTUSER,
             AIO_TGTPASS,
-            AIO_TGTPROCESSID, // Process ID of local SOCKS5 proxy
-            AIO_LOCALPROXYPORT, // Local proxy server port (default: 8888)
+            AIO_TGTPROCESSID,
+            AIO_LOCALPROXYPORT,
             AIO_CLRNAME,
             AIO_ADDNAME,
             AIO_BYPNAME
         }
 
+        /// <summary>
+        /// Sets a configuration value using a boolean parameter.
+        /// </summary>
+        /// <param name="name">Configuration name.</param>
+        /// <param name="value">Boolean value to set.</param>
+        /// <returns>True if the value was set successfully.</returns>
         public static bool Dial(NameList name, bool value)
         {
             return Dial(name, value.ToString().ToLower());
         }
 
+        /// <summary>
+        /// Sets a configuration value using a string parameter.
+        /// </summary>
+        /// <param name="name">Configuration name.</param>
+        /// <param name="value">String value to set.</param>
+        /// <returns>True if the value was set successfully.</returns>
         public static bool Dial(NameList name, string value)
         {
             switch (name)
@@ -1100,6 +1079,10 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Initializes the NetFilter driver and sets up event handlers.
+        /// </summary>
+        /// <returns>Task that completes with true if initialization succeeded, false otherwise.</returns>
         public static Task<bool> InitAsync()
         {
             return Task.Run(() =>
@@ -1209,8 +1192,6 @@ namespace OmniPoss.Interop
                     _callbackDelegates.Add(udpCanReceive);
                     _callbackDelegates.Add(udpCanSend);
 
-                    // Keep delegates alive to prevent GC collection in release mode
-                    // Using Normal instead of Pinned - delegates don't need to be pinned, just kept alive
                     _callbackHandles.Add(GCHandle.Alloc(threadStart, GCHandleType.Normal));
                     _callbackHandles.Add(GCHandle.Alloc(threadEnd, GCHandleType.Normal));
                     _callbackHandles.Add(GCHandle.Alloc(tcpConnectRequest, GCHandleType.Normal));
@@ -1228,7 +1209,6 @@ namespace OmniPoss.Interop
                     _callbackHandles.Add(GCHandle.Alloc(udpCanReceive, GCHandleType.Normal));
                     _callbackHandles.Add(GCHandle.Alloc(udpCanSend, GCHandleType.Normal));
 
-                    // Create IP/ICMP event handler delegates if ICMP filtering is enabled
                     IntPtr ipEventHandlerPtr = IntPtr.Zero;
                     if (_filterICMP)
                     {
@@ -1236,7 +1216,6 @@ namespace OmniPoss.Interop
                         var ipSend = new IpSendCallback(StubIpSend);
                         _callbackDelegates.Add(ipReceive);
                         _callbackDelegates.Add(ipSend);
-                        // Keep IP delegates alive to prevent GC collection
                         _callbackHandles.Add(GCHandle.Alloc(ipReceive, GCHandleType.Normal));
                         _callbackHandles.Add(GCHandle.Alloc(ipSend, GCHandleType.Normal));
 
@@ -1251,7 +1230,6 @@ namespace OmniPoss.Interop
                         Marshal.StructureToPtr(ipEventHandler, ipEventHandlerPtr, true);
                     }
 
-                    // Create event handler structure with valid function pointers
                     var eventHandler = new NativeNetFilterApi.NF_EventHandler
                     {
                         threadStart = Marshal.GetFunctionPointerForDelegate(threadStart),
@@ -1283,7 +1261,6 @@ namespace OmniPoss.Interop
                     Marshal.StructureToPtr(eventHandler, _eventHandlerPtr, true);
                     if (Application.MessageLoop && Application.OpenForms.Count > 0)
                     {
-                        // We're in a Windows Forms app - marshal to UI thread
                         NF_STATUS result = NF_STATUS.NF_STATUS_FAIL;
                         Exception? callException = null;
 
@@ -1317,39 +1294,33 @@ namespace OmniPoss.Interop
                         status = nf_init(_driverName, _eventHandlerPtr);
                     }
 
-                    // Set IP event handler if ICMP filtering is enabled (from Redirector.bin line 15762)
                     if (status == NF_STATUS.NF_STATUS_SUCCESS && _filterICMP && ipEventHandlerPtr != IntPtr.Zero)
                     {
                         try
                         {
                             NativeNetFilterApi.nf_setIPEventHandler(ipEventHandlerPtr);
-                            _ipEventHandlerPtr = ipEventHandlerPtr; // Store for cleanup
+                            _ipEventHandlerPtr = ipEventHandlerPtr;
                             Log.Information("ICMP/IP event handler registered (delay: {Delay}ms)", _icmpDelay);
                         }
                         catch (Exception ex)
                         {
                             Log.Warning(ex, "Failed to set IP event handler - ICMP filtering may not work");
-                            // Continue anyway - ICMP filtering is optional
                         }
                     }
                     else if (ipEventHandlerPtr != IntPtr.Zero)
                     {
-                        // Free IP event handler if initialization failed
                         Marshal.FreeHGlobal(ipEventHandlerPtr);
                         ipEventHandlerPtr = IntPtr.Zero;
                     }
 
                     if (status != NF_STATUS.NF_STATUS_SUCCESS)
                     {
-                        // Free the event handler memory if initialization failed
-                        // since we won't be keeping it for the API lifetime
                         if (_eventHandlerPtr != IntPtr.Zero)
                         {
                             Marshal.FreeHGlobal(_eventHandlerPtr);
                             _eventHandlerPtr = IntPtr.Zero;
                         }
 
-                        // Get more details about the failure
                         var errorMsg = $"Failed to initialize NetFilter API with driver '{_driverName}': {status}";
                         if (status == NF_STATUS.NF_STATUS_FAIL)
                         {
@@ -1361,27 +1332,23 @@ namespace OmniPoss.Interop
                         }
                         catch
                         {
-                            // Ignore unregister errors during cleanup
                         }
                         throw new Exception(errorMsg);
                     }
 
-                    // Initialize local proxy servers (SocksRedirector pattern)
                     if (!string.IsNullOrEmpty(_targetHost) && _targetPort > 0)
                     {
                         try
                         {
                             var socks5Target = new IPEndPoint(IPAddress.Parse(_targetHost), _targetPort);
 
-                            // Initialize TCP proxy
                             _tcpProxy = new LocalTcpProxy();
                             if (!_tcpProxy.Initialize(_localProxyPort, socks5Target, _targetUser, _targetPass))
                             {
                                 throw new Exception("Failed to initialize local TCP proxy");
                             }
-                            _localProxyPort = _tcpProxy.ListenPort; // Use actual port assigned
+                            _localProxyPort = _tcpProxy.ListenPort;
 
-                            // Initialize UDP proxy
                             _udpProxy = new LocalUdpProxy(socks5Target, _targetUser, _targetPass);
 
                             Log.Information("Local proxy servers initialized: TCP on port {TcpPort}, SOCKS5 target: {Socks5Target}",
@@ -1398,7 +1365,6 @@ namespace OmniPoss.Interop
                         Log.Warning("SOCKS5 target not configured - local proxy servers not initialized");
                     }
 
-                    // Create and apply filtering rules
                     try
                     {
                         ApplyRules();
@@ -1413,18 +1379,15 @@ namespace OmniPoss.Interop
                             }
                             catch
                             {
-                                // Ignore errors during cleanup
                             }
                             Marshal.FreeHGlobal(_eventHandlerPtr);
                             _eventHandlerPtr = IntPtr.Zero;
                         }
-                        // Cleanup proxies
                         _tcpProxy?.Dispose();
                         _udpProxy?.Dispose();
                         throw new Exception($"Failed to apply filtering rules: {ex.Message}", ex);
                     }
 
-                    // Pin caches to prevent GC collection in release mode
                     if (!_processCacheHandle.IsAllocated)
                     {
                         _processCacheHandle = GCHandle.Alloc(_processCache, GCHandleType.Normal);
@@ -1446,6 +1409,10 @@ namespace OmniPoss.Interop
             });
         }
 
+        /// <summary>
+        /// Frees the NetFilter driver and cleans up resources.
+        /// </summary>
+        /// <returns>Task that completes with true if cleanup succeeded, false otherwise.</returns>
         public static Task<bool> FreeAsync()
         {
             return Task.Run(() =>
@@ -1477,7 +1444,6 @@ namespace OmniPoss.Interop
                         }
                         catch
                         {
-                            // Ignore unregister errors
                         }
                     }
 
@@ -1490,7 +1456,6 @@ namespace OmniPoss.Interop
                     _processCache.Clear();
                     _patternMatchCache.Clear();
 
-                    // Free GCHandles to prevent memory leaks
                     foreach (var handle in _callbackHandles)
                     {
                         if (handle.IsAllocated)
@@ -1501,7 +1466,6 @@ namespace OmniPoss.Interop
                     _callbackHandles.Clear();
                     _callbackDelegates.Clear();
 
-                    // Free cache handles
                     if (_processCacheHandle.IsAllocated)
                     {
                         _processCacheHandle.Free();
@@ -1523,13 +1487,21 @@ namespace OmniPoss.Interop
             });
         }
 
+        /// <summary>
+        /// Registers the driver name for NetFilter initialization.
+        /// </summary>
+        /// <param name="value">Driver name to register.</param>
+        /// <returns>True if registration succeeded.</returns>
         public static bool aio_register(string value)
         {
             _driverName = value;
             return true;
         }
 
-        // Statistics getters (from Redirector.bin aio_getUP and aio_getDL)
+        /// <summary>
+        /// Gets the total number of bytes uploaded.
+        /// </summary>
+        /// <returns>Total upload bytes.</returns>
         public static long GetUploadBytes()
         {
             lock (_statsLock)
@@ -1538,6 +1510,10 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Gets the total number of bytes downloaded.
+        /// </summary>
+        /// <returns>Total download bytes.</returns>
         public static long GetDownloadBytes()
         {
             lock (_statsLock)
@@ -1546,6 +1522,9 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Resets upload and download statistics to zero.
+        /// </summary>
         public static void ResetStatistics()
         {
             lock (_statsLock)
@@ -1555,6 +1534,11 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Unregisters the NetFilter driver and frees resources.
+        /// </summary>
+        /// <param name="value">Driver name to unregister.</param>
+        /// <returns>True if unregistration succeeded.</returns>
         public static bool aio_unregister(string value)
         {
             if (_isInitialized)
@@ -1566,12 +1550,9 @@ namespace OmniPoss.Interop
                 }
                 catch (EntryPointNotFoundException)
                 {
-                    // Function may not be available in all SDK versions
-                    // Driver will be unregistered when service stops
                 }
                 catch (DllNotFoundException)
                 {
-                    // DLL not found - skip unregister
                 }
 
                 _isInitialized = false;
@@ -1579,9 +1560,9 @@ namespace OmniPoss.Interop
             return true;
         }
 
-        // Event handler creation removed - using IntPtr.Zero for rule-based redirection
-        // Event handlers can be added later for advanced SOCKS5 protocol handling
-
+        /// <summary>
+        /// Applies filtering rules to the NetFilter driver based on current configuration.
+        /// </summary>
         private static void ApplyRules()
         {
             Log.Information("[Rules] Starting rule application: Target={TargetHost}:{TargetPort}, FilterLoopback={FilterLoopback}, FilterIntranet={FilterIntranet}",
@@ -1738,6 +1719,13 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Creates a redirect rule for the NetFilter driver.
+        /// </summary>
+        /// <param name="redirectAddr">Target address to redirect to.</param>
+        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
+        /// <param name="protocol">Protocol (IPPROTO_TCP or IPPROTO_UDP).</param>
+        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateRedirectRule(byte[] redirectAddr, int ipFamily, int protocol = IPPROTO_TCP)
         {
             uint filteringFlag;
@@ -1773,6 +1761,13 @@ namespace OmniPoss.Interop
             return rule;
         }
 
+        /// <summary>
+        /// Creates a bypass rule for processes matching the specified pattern.
+        /// </summary>
+        /// <param name="processNamePattern">Process name pattern to match.</param>
+        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
+        /// <param name="protocol">Protocol (IPPROTO_TCP or IPPROTO_UDP).</param>
+        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateBypassRule(string processNamePattern, int ipFamily, int protocol = IPPROTO_TCP)
         {
             return new NF_RULE_EX
@@ -1796,6 +1791,14 @@ namespace OmniPoss.Interop
             };
         }
 
+        /// <summary>
+        /// Creates a bypass rule for a network range.
+        /// </summary>
+        /// <param name="network">Network address.</param>
+        /// <param name="mask">Network mask.</param>
+        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
+        /// <param name="protocol">Protocol (IPPROTO_TCP or IPPROTO_UDP).</param>
+        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateBypassRuleForNetwork(IPAddress network, IPAddress mask, int ipFamily, int protocol = IPPROTO_TCP)
         {
             var rule = new NF_RULE_EX
@@ -1836,6 +1839,14 @@ namespace OmniPoss.Interop
             return rule;
         }
 
+        /// <summary>
+        /// Creates a handle rule for processes matching the specified pattern.
+        /// </summary>
+        /// <param name="processNamePattern">Process name pattern to match.</param>
+        /// <param name="redirectAddr">Target address to redirect to.</param>
+        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
+        /// <param name="protocol">Protocol (IPPROTO_TCP or IPPROTO_UDP).</param>
+        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateHandleRule(string processNamePattern, byte[] redirectAddr, int ipFamily, int protocol = IPPROTO_TCP)
         {
             var rule = CreateRedirectRule(redirectAddr, ipFamily, protocol);
@@ -1843,6 +1854,11 @@ namespace OmniPoss.Interop
             return rule;
         }
 
+        /// <summary>
+        /// Creates an ICMP filtering rule.
+        /// </summary>
+        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
+        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateIcmpRule(int ipFamily)
         {
             return new NF_RULE_EX
@@ -1937,6 +1953,7 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Queues a log message for background processing to avoid blocking callbacks.
         /// </summary>
+        /// <param name="logAction">Action that performs the logging operation.</param>
         private static void QueueLog(Action logAction)
         {
             if (_isInitialized)
@@ -1956,6 +1973,8 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Maps NFConfig properties to Redirector.Dial calls for comprehensive configuration.
         /// </summary>
+        /// <param name="config">NFConfig instance containing configuration values.</param>
+        /// <exception cref="ArgumentNullException">Thrown when config is null.</exception>
         public static void ConfigureFromNFConfig(Configuration.NFConfig config)
         {
             if (config == null)

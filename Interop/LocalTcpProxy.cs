@@ -84,9 +84,6 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// Initialize the local TCP proxy server.
-        /// </summary>
-        /// <summary>
         /// Initializes the local TCP proxy server. Sets up IPv4 and IPv6 listeners with socket reuse option for rapid reloads.
         /// </summary>
         /// <param name="port">Port to listen on (typically 8888).</param>
@@ -105,6 +102,8 @@ namespace OmniPoss.Interop
             _socks5Target = socks5Target;
             _socks5Username = username;
             _socks5Password = password;
+
+            _ = PreWarmConnectionAsync();
 
             try
             {
@@ -198,6 +197,38 @@ namespace OmniPoss.Interop
 
 
         /// <summary>
+        /// Pre-warms the connection to the SOCKS5 server by establishing and immediately closing a test connection.
+        /// This reduces latency for the first actual connection by warming up DNS resolution, TCP stack, and OS-level caches.
+        /// </summary>
+        private async Task PreWarmConnectionAsync()
+        {
+            try
+            {
+                if (_cancellationTokenSource.Token.IsCancellationRequested || _socks5Target == null)
+                    return;
+                
+                // Create a test connection to warm up the connection path
+                // Use shorter timeout for localhost (should be instant)
+                var (testClient, testStream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 500);
+                
+                // Immediately close the test connection - we just wanted to warm up the path
+                try
+                {
+                    testStream?.Close();
+                    testClient?.Close();
+                }
+                catch { }
+                
+                Log.Debug("LocalTcpProxy: Pre-warmed connection to SOCKS5 server {Target}", _socks5Target);
+            }
+            catch (Exception ex)
+            {
+                // Pre-warming is best-effort; don't fail initialization if it fails
+                Log.Debug(ex, "LocalTcpProxy: Pre-warming connection failed (non-critical)");
+            }
+        }
+
+        /// <summary>
         /// Creates a new SOCKS5 connection using WSAConnectByNameW for optimized performance.
         /// </summary>
         internal async Task<(TcpClient client, NetworkStream stream)> GetSocks5ConnectionAsync()
@@ -229,6 +260,11 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Checks if the specified IP address family is available.
+        /// </summary>
+        /// <param name="ipFamily">Address family to check.</param>
+        /// <returns>True if the address family is available.</returns>
         public bool IsIPFamilyAvailable(AddressFamily ipFamily)
         {
             return ipFamily switch
@@ -239,6 +275,9 @@ namespace OmniPoss.Interop
             };
         }
 
+        /// <summary>
+        /// Disposes the local TCP proxy and cleans up all resources.
+        /// </summary>
         public void Dispose()
         {
             if (!_isInitialized)
@@ -342,7 +381,6 @@ namespace OmniPoss.Interop
                 clientSocket.SendTimeout = 10000;
                 clientSocket.ReceiveTimeout = 10000;
 
-                // Get connection info first (this is fast, just a dictionary lookup)
                 if (!_proxy.GetRemoteAddress(_remoteEndPoint, out var connInfo))
                 {
                     Log.Warning("TcpProxyConnection {Id}: Could not find connection info for port {Port}", _id, _remoteEndPoint.Port);
@@ -356,13 +394,11 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Get SOCKS5 connection AFTER we have the destination info
                 var (socks5Client, socks5Stream) = await _proxy.GetSocks5ConnectionAsync();
 
                 _socks5Client = socks5Client;
                 _socks5Stream = socks5Stream;
 
-                // Perform SOCKS5 authentication
                 _state = Socks5State.Auth;
                 await SendAuthRequestAsync();
 
@@ -416,7 +452,6 @@ namespace OmniPoss.Interop
                     }
                 }
 
-                // Start bidirectional data relay
                 _state = Socks5State.Connected;
 
                 var clientToSocks5 = RelayDataAsync(_clientStream!, _socks5Stream, cancellationToken);
@@ -439,12 +474,10 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Check the address family from the sockaddr structure itself
                 ushort addrFamily = BitConverter.ToUInt16(connInfo.remoteAddress, 0);
 
-                if (addrFamily == 2) // AF_INET
+                if (addrFamily == 2)
                 {
-                    // sockaddr_in structure: family(2) + port(2) + addr(4) = 8 bytes
                     if (connInfo.remoteAddress.Length < 8)
                         return null;
 
@@ -456,9 +489,8 @@ namespace OmniPoss.Interop
 
                     return new IPEndPoint(ip, port);
                 }
-                else if (addrFamily == 23) // AF_INET6
+                else if (addrFamily == 23)
                 {
-                    // sockaddr_in6 structure: family(2) + port(2) + flowinfo(4) + addr(16) = 24 bytes
                     if (connInfo.remoteAddress.Length < 24)
                         return null;
 
@@ -492,12 +524,11 @@ namespace OmniPoss.Interop
             byte[] request;
             if (destination.AddressFamily == AddressFamily.InterNetwork)
             {
-                // IPv4 CONNECT request
                 request = new byte[10];
-                request[0] = 0x05; // Version
-                request[1] = 0x01; // CONNECT
-                request[2] = 0x00; // Reserved
-                request[3] = 0x01; // IPv4 address type
+                request[0] = 0x05;
+                request[1] = 0x01;
+                request[2] = 0x00;
+                request[3] = 0x01;
                 var ipBytes = destination.Address.GetAddressBytes();
                 Array.Copy(ipBytes, 0, request, 4, 4);
                 var portBytes = BitConverter.GetBytes((ushort)IPAddress.HostToNetworkOrder((short)destination.Port));
@@ -505,12 +536,11 @@ namespace OmniPoss.Interop
             }
             else
             {
-                // IPv6 CONNECT request
                 request = new byte[22];
-                request[0] = 0x05; // Version
-                request[1] = 0x01; // CONNECT
-                request[2] = 0x00; // Reserved
-                request[3] = 0x04; // IPv6 address type
+                request[0] = 0x05;
+                request[1] = 0x01;
+                request[2] = 0x00;
+                request[3] = 0x04;
                 var ipBytes = destination.Address.GetAddressBytes();
                 Array.Copy(ipBytes, 0, request, 4, 16);
                 var portBytes = BitConverter.GetBytes((ushort)IPAddress.HostToNetworkOrder((short)destination.Port));
@@ -535,11 +565,11 @@ namespace OmniPoss.Interop
 
             var addressType = buffer[3];
             int responseLength;
-            if (addressType == 0x01) // IPv4
+            if (addressType == 0x01)
             {
                 responseLength = 10;
             }
-            else if (addressType == 0x04) // IPv6
+            else if (addressType == 0x04)
             {
                 responseLength = 22;
             }
@@ -562,11 +592,11 @@ namespace OmniPoss.Interop
             byte[] request;
             if (!string.IsNullOrEmpty(_username))
             {
-                request = new byte[] { 0x05, 0x01, 0x02 }; // Version 5, 1 method, username/password
+                request = new byte[] { 0x05, 0x01, 0x02 };
             }
             else
             {
-                request = new byte[] { 0x05, 0x01, 0x00 }; // Version 5, 1 method, no auth
+                request = new byte[] { 0x05, 0x01, 0x00 };
             }
             await _socks5Stream!.WriteAsync(request);
         }
@@ -580,7 +610,7 @@ namespace OmniPoss.Interop
             var passwordBytes = System.Text.Encoding.UTF8.GetBytes(_password ?? "");
 
             var request = new byte[3 + usernameBytes.Length + passwordBytes.Length];
-            request[0] = 0x01; // Version
+            request[0] = 0x01;
             request[1] = (byte)usernameBytes.Length;
             Array.Copy(usernameBytes, 0, request, 2, usernameBytes.Length);
             request[2 + usernameBytes.Length] = (byte)passwordBytes.Length;
@@ -619,7 +649,6 @@ namespace OmniPoss.Interop
 
             _isDisposed = true;
 
-            // Close SOCKS5 connection
             try { _socks5Stream?.Close(); } catch { }
             try { _socks5Client?.Close(); } catch { }
             _socks5Client = null;

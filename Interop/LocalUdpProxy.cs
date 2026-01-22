@@ -31,8 +31,12 @@ namespace OmniPoss.Interop
         /// </summary>
         public bool CreateProxyConnection(ulong id)
         {
-            if (_connections.ContainsKey(id))
-                return true;
+            if (_connections.TryGetValue(id, out var existingConnection))
+            {
+                if (existingConnection != null)
+                    return true;
+                _connections.TryRemove(id, out _);
+            }
 
             try
             {
@@ -41,6 +45,10 @@ namespace OmniPoss.Interop
                 {
                     _connections[id] = connection;
                     return true;
+                }
+                else
+                {
+                    try { connection.Dispose(); } catch { }
                 }
             }
             catch (Exception ex)
@@ -74,17 +82,26 @@ namespace OmniPoss.Interop
         /// </summary>
         public bool UdpSend(ulong id, byte[] data, int length, IPEndPoint remoteEndPoint, IntPtr options, IntPtr originalRemoteAddress)
         {
-            if (!_connections.TryGetValue(id, out var connection))
+            if (!_connections.TryGetValue(id, out var connection) || connection == null)
             {
                 if (!CreateProxyConnection(id))
                     return false;
-                _connections.TryGetValue(id, out connection);
-            }
+                if (!_connections.TryGetValue(id, out connection) || connection == null)
+                    return false;
+                }
 
-            if (connection == null)
-                return false;
+            if (!connection.IsConnected && connection.IsInitializationComplete)
+            {
+                Log.Warning("LocalUdpProxy: Connection {Id} is in failed state, removing and retrying", id);
+                _connections.TryRemove(id, out var failedConnection);
+                try { failedConnection?.Dispose(); } catch { }
+                
+                if (!CreateProxyConnection(id))
+                    return false;
+                if (!_connections.TryGetValue(id, out connection) || connection == null)
+                    return false;
+                }
 
-            // Store options and original remote address for posting data back
             connection.StoreOptions(options);
             connection.StoreOriginalRemoteAddress(originalRemoteAddress);
 
@@ -94,10 +111,17 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Handle UDP receive callback from UdpProxyConnection when data arrives from relay endpoint.
         /// </summary>
+        /// <param name="id">Connection ID.</param>
+        /// <param name="data">Received data.</param>
+        /// <param name="length">Data length.</param>
+        /// <param name="originalDestination">Original destination endpoint.</param>
         public void OnUdpReceive(ulong id, byte[] data, int length, IPEndPoint originalDestination)
         {
         }
 
+        /// <summary>
+        /// Disposes the UDP proxy and cleans up all resources.
+        /// </summary>
         public void Dispose()
         {
             if (_isDisposed)
@@ -136,18 +160,37 @@ namespace OmniPoss.Interop
         private IPEndPoint? _udpRelayEndPoint;
         private bool _isConnected = false;
         private readonly ConcurrentQueue<UdpPacket> _pendingPackets = new();
-        /// <summary>
-        /// Deep-copied UDP options for posting data back via nf_udpPostReceive.
-        /// Original options pointer is only valid during callback context.
-        /// </summary>
         private IntPtr _storedOptions = IntPtr.Zero;
         private int _storedOptionsLength = 0;
         private byte[]? _originalRemoteAddressBytes = null;
         private readonly CancellationTokenSource _receiveCancellation = new();
-        private readonly LocalUdpProxy? _proxy = proxy; // Reference to parent proxy for callbacks
+        private readonly LocalUdpProxy? _proxy = proxy;
         private readonly ConcurrentQueue<(IntPtr remoteAddr, IntPtr data)> _pendingBuffers = new();
         private Task? _cleanupTask = null;
         private readonly object _cleanupLock = new object();
+        private int _consecutiveFailures = 0;
+        private const int MaxConsecutiveFailures = 3;
+        private Task? _initializationTask = null;
+        private readonly object _initLock = new object();
+
+        /// <summary>
+        /// Gets whether the connection is currently connected.
+        /// </summary>
+        internal bool IsConnected => _isConnected;
+
+        /// <summary>
+        /// Gets whether initialization has completed (successfully or not).
+        /// </summary>
+        internal bool IsInitializationComplete
+        {
+            get
+            {
+                lock (_initLock)
+                {
+                    return _initializationTask != null && _initializationTask.IsCompleted;
+                }
+            }
+        }
 
         private enum Socks5State
         {
@@ -211,7 +254,13 @@ namespace OmniPoss.Interop
         {
             try
             {
-                _ = InitializeAsync();
+                lock (_initLock)
+                {
+                    if (_initializationTask == null || _initializationTask.IsCompleted)
+                    {
+                        _initializationTask = InitializeAsync();
+                    }
+                }
                 return true;
             }
             catch (Exception ex)
@@ -228,13 +277,10 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Use optimized connection method (5 second timeout for control channel)
                 var (client, stream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 5000);
                 _tcpControlClient = client;
                 
-                // Socket options are already set by the helper, but we can verify/override if needed
                 var socket = _tcpControlClient.Client;
-                // Helper already sets NoDelay, KeepAlive, and timeouts, but we ensure they're correct
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
                 
@@ -246,6 +292,9 @@ namespace OmniPoss.Interop
             {
                 Log.Error(ex, "UdpProxyConnection {Id}: Async initialization failed", _id);
                 _isConnected = false;
+                try { _tcpControlStream?.Close(); } catch { }
+                try { _tcpControlClient?.Close(); } catch { }
+                try { _udpClient?.Close(); } catch { }
             }
         }
 
@@ -260,12 +309,13 @@ namespace OmniPoss.Interop
                 await SendAuthRequestAsync();
 
                 var authResponse = new byte[2];
-                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
+                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
                 {
                     var bytesRead = await _tcpControlStream!.ReadAsync(authResponse, readCts.Token);
                     if (bytesRead < 2 || authResponse[0] != 0x05)
                     {
                         Log.Warning("UdpProxyConnection {Id}: Invalid auth response", _id);
+                        _isConnected = false;
                         return;
                     }
                 }
@@ -277,12 +327,13 @@ namespace OmniPoss.Interop
                     _state = Socks5State.AuthNegotiation;
                     await SendUsernamePasswordAuthAsync();
 
-                    using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(1)))
+                    using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
                     {
                         var bytesRead = await _tcpControlStream.ReadAsync(authResponse, readCts.Token);
                         if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
                         {
                             Log.Warning("UdpProxyConnection {Id}: Username/password auth failed", _id);
+                            _isConnected = false;
                             return;
                         }
                     }
@@ -290,6 +341,7 @@ namespace OmniPoss.Interop
                 else if (method != 0x00)
                 {
                     Log.Warning("UdpProxyConnection {Id}: Unsupported auth method {Method}", _id, method);
+                    _isConnected = false;
                     return;
                 }
 
@@ -297,12 +349,13 @@ namespace OmniPoss.Interop
                 await SendUdpAssociateRequestAsync();
 
                 IPEndPoint? response;
-                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(2)))
+                using (var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
                 {
                     response = await ReadUdpAssociateResponseAsync(readCts.Token);
                     if (response == null)
                     {
                         Log.Warning("UdpProxyConnection {Id}: UDP ASSOCIATE failed", _id);
+                        _isConnected = false;
                         return;
                     }
                 }
@@ -314,9 +367,14 @@ namespace OmniPoss.Interop
                 udpSocket.SendTimeout = 10000;
                 udpSocket.ReceiveTimeout = 10000;
                 
+                const int bufferSize = 512 * 1024;
+                udpSocket.ReceiveBufferSize = bufferSize;
+                udpSocket.SendBufferSize = bufferSize;
+                
                 _udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
                 _isConnected = true;
                 _state = Socks5State.Connected;
+                _consecutiveFailures = 0;
 
 
                 while (_pendingPackets.TryDequeue(out var packet))
@@ -348,11 +406,11 @@ namespace OmniPoss.Interop
             byte[] request;
             if (!string.IsNullOrEmpty(_username))
             {
-                request = new byte[] { 0x05, 0x01, 0x02 }; // Version 5, 1 method, username/password
+                request = new byte[] { 0x05, 0x01, 0x02 };
             }
             else
             {
-                request = new byte[] { 0x05, 0x01, 0x00 }; // Version 5, 1 method, no auth
+                request = new byte[] { 0x05, 0x01, 0x00 };
             }
             await _tcpControlStream!.WriteAsync(request);
         }
@@ -366,7 +424,7 @@ namespace OmniPoss.Interop
             var passwordBytes = System.Text.Encoding.UTF8.GetBytes(_password ?? "");
 
             var request = new byte[3 + usernameBytes.Length + passwordBytes.Length];
-            request[0] = 0x01; // Version
+            request[0] = 0x01;
             request[1] = (byte)usernameBytes.Length;
             Array.Copy(usernameBytes, 0, request, 2, usernameBytes.Length);
             request[2 + usernameBytes.Length] = (byte)passwordBytes.Length;
@@ -380,14 +438,11 @@ namespace OmniPoss.Interop
         /// </summary>
         private async Task SendUdpAssociateRequestAsync()
         {
-            // UDP ASSOCIATE request with IPv4 (0.0.0.0:0)
             var request = new byte[10];
-            request[0] = 0x05; // Version
-            request[1] = 0x03; // UDP ASSOCIATE
-            request[2] = 0x00; // Reserved
-            request[3] = 0x01; // IPv4 address type
-            // Address: 0.0.0.0 (already zeros)
-            // Port: 0 (already zeros)
+            request[0] = 0x05;
+            request[1] = 0x03;
+            request[2] = 0x00;
+            request[3] = 0x01;
             await _tcpControlStream!.WriteAsync(request);
         }
 
@@ -417,13 +472,49 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Sends UDP packet to SOCKS5 relay wrapped in SOCKS5 UDP format.
+        /// Waits for connection readiness if initialization is in progress.
         /// </summary>
+        /// <summary>
+        /// Sends UDP packet to SOCKS5 relay wrapped in SOCKS5 UDP format.
+        /// </summary>
+        /// <param name="data">Data to send.</param>
+        /// <param name="length">Data length.</param>
+        /// <param name="remoteEndPoint">Remote endpoint to send to.</param>
+        /// <returns>True if send succeeded, false otherwise.</returns>
         public bool Send(byte[] data, int length, IPEndPoint remoteEndPoint)
         {
             if (!_isConnected || _udpClient == null || _udpRelayEndPoint == null)
             {
-                _pendingPackets.Enqueue(new UdpPacket { Data = data, Length = length, RemoteEndPoint = remoteEndPoint });
-                return true;
+                Task? initTask = null;
+                lock (_initLock)
+                {
+                    initTask = _initializationTask;
+                }
+
+                if (initTask != null && !initTask.IsCompleted)
+                {
+#pragma warning disable VSTHRD002
+                    try
+                    {
+                        if (!initTask.Wait(TimeSpan.FromSeconds(5)))
+#pragma warning restore VSTHRD002
+                        {
+                            _pendingPackets.Enqueue(new UdpPacket { Data = data, Length = length, RemoteEndPoint = remoteEndPoint });
+                            return true;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        _pendingPackets.Enqueue(new UdpPacket { Data = data, Length = length, RemoteEndPoint = remoteEndPoint });
+                        return true;
+                    }
+                }
+
+                if (!_isConnected || _udpClient == null || _udpRelayEndPoint == null)
+                {
+                    _pendingPackets.Enqueue(new UdpPacket { Data = data, Length = length, RemoteEndPoint = remoteEndPoint });
+                    return true;
+                }
             }
 
             try
@@ -460,6 +551,9 @@ namespace OmniPoss.Interop
         /// <summary>
         /// Placeholder for handling received UDP packets from NetFilter.
         /// </summary>
+        /// <param name="data">Received data.</param>
+        /// <param name="length">Data length.</param>
+        /// <param name="remoteEndPoint">Remote endpoint.</param>
         public void HandleReceive(byte[] data, int length, IPEndPoint remoteEndPoint)
         {
         }
@@ -481,7 +575,6 @@ namespace OmniPoss.Interop
                 {
                     try
                     {
-                        // Use cancellation token to allow graceful shutdown
                         var receiveTask = _udpClient.ReceiveAsync();
                         var result = await receiveTask.WaitAsync(cts.Token);
 
@@ -543,13 +636,25 @@ namespace OmniPoss.Interop
                         if (dataLength <= 0)
                             continue;
 
-                        byte[] data = new byte[dataLength];
-                        Array.Copy(result.Buffer, headerSize, data, 0, dataLength);
-
                         if (!_isConnected)
                         {
                             continue;
                         }
+
+                        if (_proxy != null && !_proxy.HasConnection(_id))
+                        {
+                            _isConnected = false;
+                            break;
+                        }
+
+                        if (_consecutiveFailures >= MaxConsecutiveFailures)
+                        {
+                            _isConnected = false;
+                            break;
+                        }
+
+                        byte[] data = new byte[dataLength];
+                        Array.Copy(result.Buffer, headerSize, data, 0, dataLength);
 
                         IntPtr remoteAddrPtr = Marshal.AllocHGlobal(remoteAddressBytes.Length);
                         IntPtr dataPtr = Marshal.AllocHGlobal(dataLength);
@@ -570,51 +675,67 @@ namespace OmniPoss.Interop
                             var status = NativeNetFilterApi.nf_udpPostReceive(_id, remoteAddrPtr, dataPtr, dataLength, optionsPtr);
                             if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
                             {
+                                _consecutiveFailures = 0;
                                 _pendingBuffers.Enqueue((remoteAddrPtr, dataPtr));
                                 remoteAddrPtr = IntPtr.Zero;
                                 dataPtr = IntPtr.Zero;
                             }
                             else
                             {
+                                _consecutiveFailures++;
+                                
                                 if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_INVALID_ENDPOINT_ID)
                                 {
                                     _isConnected = false;
+                                    Marshal.FreeHGlobal(remoteAddrPtr);
+                                    Marshal.FreeHGlobal(dataPtr);
+                                    break; // Exit receive loop immediately
                                 }
-                                else if (_isConnected)
+                                else if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_FAIL)
                                 {
-                                    Log.Warning("UdpProxyConnection {Id}: nf_udpPostReceive failed with status {Status}", _id, status);
+                                    if (_consecutiveFailures == MaxConsecutiveFailures)
+                                    {
+                                        _isConnected = false;
+                                        Marshal.FreeHGlobal(remoteAddrPtr);
+                                        Marshal.FreeHGlobal(dataPtr);
+                                        break;
+                                    }
                                 }
+                                
                                 Marshal.FreeHGlobal(remoteAddrPtr);
                                 Marshal.FreeHGlobal(dataPtr);
                             }
                         }
                         catch (Exception ex)
                         {
-                            Log.Error(ex, "UdpProxyConnection {Id}: Error posting data to NetFilter", _id);
+                            _consecutiveFailures++;
+                            Log.Error(ex, "UdpProxyConnection {Id}: Exception posting data to NetFilter (consecutive failures: {Count})", _id, _consecutiveFailures);
                             if (remoteAddrPtr != IntPtr.Zero) Marshal.FreeHGlobal(remoteAddrPtr);
                             if (dataPtr != IntPtr.Zero) Marshal.FreeHGlobal(dataPtr);
+                            
+                            if (_consecutiveFailures >= MaxConsecutiveFailures)
+                            {
+                                _isConnected = false;
+                                break;
+                            }
                         }
                     }
                     catch (OperationCanceledException)
                     {
-                        // Expected when connection is closed
                         break;
                     }
                     catch (ObjectDisposedException)
                     {
-                        // UDP client was disposed, exit gracefully
                         break;
                     }
                     catch (SocketException ex) when (ex.SocketErrorCode == SocketError.OperationAborted || ex.SocketErrorCode == SocketError.Interrupted)
                     {
-                        // Operation was cancelled, exit gracefully
                         break;
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                // Expected when connection is closed
             }
             catch (Exception ex) when (ex is ObjectDisposedException ||
                                        (ex is SocketException se && (se.SocketErrorCode == SocketError.OperationAborted || se.SocketErrorCode == SocketError.Interrupted)))
@@ -638,7 +759,7 @@ namespace OmniPoss.Interop
             {
                 while (_isConnected && !_receiveCancellation.Token.IsCancellationRequested)
                 {
-                    await Task.Delay(500, _receiveCancellation.Token);
+                    await Task.Delay(100, _receiveCancellation.Token);
 
                     if (_pendingBuffers.TryDequeue(out var buffer))
                     {
@@ -663,6 +784,9 @@ namespace OmniPoss.Interop
             }
         }
 
+        /// <summary>
+        /// Disposes the UDP proxy connection and cleans up all resources.
+        /// </summary>
         public void Dispose()
         {
             _isConnected = false;
