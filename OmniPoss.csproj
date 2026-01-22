@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 	<UseWindowsForms>true</UseWindowsForms>
-	<ApplicationIcon>New Project.ico</ApplicationIcon>
+	<ApplicationIcon>Icons\favicon.ico</ApplicationIcon>
 	<NoWin32Manifest>true</NoWin32Manifest>
     <!-- Exclude debug symbols from publish output -->
 	  <DebugType>none</DebugType>
@@ -16,7 +16,6 @@
 
 
   <ItemGroup>
-    <Content Include="New Project.ico" />
     <Content Include="LICENSE">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

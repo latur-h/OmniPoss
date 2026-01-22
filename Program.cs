@@ -158,10 +158,7 @@ namespace OmniPoss
                 services.AddNetFilterServices(config);
                 using var serviceProvider = services.BuildServiceProvider();
 
-                // Create application host
                 using var appHost = new ApplicationHost(serviceProvider);
-
-                // Initialize and start components
                 await appHost.InitializeAsync();
 
                 ConsoleManager.Hide();
@@ -170,7 +167,6 @@ namespace OmniPoss
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
-                // Create tray icon
                 var trayIcon = appHost.CreateTrayIcon();
 
                 // Create hidden form to handle Windows shutdown signals
@@ -188,7 +184,7 @@ namespace OmniPoss
                 }
                 catch (OperationCanceledException)
                 {
-                    // Expected cancellation
+
                 }
                 catch (Exception ex)
                 {
