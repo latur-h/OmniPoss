@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OmniPoss.Configuration;
 using OmniPoss.Core;
@@ -209,7 +209,7 @@ namespace OmniPoss
         /// Creates or removes a shortcut in the Windows Startup folder based on the AutoStart flag.
         /// </summary>
         /// <param name="autoStart">If true, creates the shortcut; if false, removes it.</param>
-        private static void ManageStartupShortcut(bool autoStart)
+        public static void ManageStartupShortcut(bool autoStart)
         {
             try
             {

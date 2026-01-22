@@ -7,6 +7,7 @@ using OmniPoss.Servers;
 using OmniPoss.UI.Tray;
 using System.Collections.Concurrent;
 using Newtonsoft.Json;
+using System.IO;
 
 namespace OmniPoss.Core
 {
@@ -113,7 +114,9 @@ namespace OmniPoss.Core
         public NotifyIcon CreateTrayIcon()
         {
             var cores = _serviceProvider.GetRequiredService<List<CoreConfig>>();
-            var trayMenu = _trayMenu.Init(cores, _config.NFConfig.Enabled, _config.ProxyConfig.Enabled);
+            // Pass function to check actual running state of cores
+            var trayMenu = _trayMenu.Init(cores, _config.NFConfig.Enabled, _config.ProxyConfig.Enabled, _config.AutoStart, 
+                (key) => _coreManager.IsRunning(key));
 
             // Attach event handlers
             if (trayMenu.Items["NF"] is ToolStripMenuItem nfItem)
@@ -162,6 +165,14 @@ namespace OmniPoss.Core
                 reloadItem.Click += (s, e) =>
                 {
                     var task = Task.Run(async () => await ReloadAsync(), _shutdownCts.Token);
+                    _backgroundTasks.Add(task);
+                };
+            }
+            if (trayMenu.Items["StartWithWindows"] is ToolStripMenuItem startWithWindowsItem)
+            {
+                startWithWindowsItem.Click += (s, e) =>
+                {
+                    var task = Task.Run(async () => await ToggleStartupAsync(), _shutdownCts.Token);
                     _backgroundTasks.Add(task);
                 };
             }
@@ -413,6 +424,7 @@ namespace OmniPoss.Core
         {
             return new ApplicationConfig
             {
+                AutoStart = config.AutoStart,
                 Cores = config.Cores.Select(c => new CoreConfig(c.Key, c.ExePath, c.Argument) { Enabled = c.Enabled }).ToList(),
                 Socks5ServerConfig = new Socks5ClientConfig { Hostname = config.Socks5ServerConfig.Hostname, Port = config.Socks5ServerConfig.Port },
                 ProxyConfig = new ProxyConfig(config.ProxyConfig.Hostname, config.ProxyConfig.Port) { Enabled = config.ProxyConfig.Enabled },
@@ -442,6 +454,9 @@ namespace OmniPoss.Core
         /// </summary>
         private void UpdateConfigProperties(ApplicationConfig existing, ApplicationConfig newConfig)
         {
+            // Update AutoStart
+            existing.AutoStart = newConfig.AutoStart;
+
             // Update cores list
             existing.Cores.Clear();
             existing.Cores.AddRange(newConfig.Cores);
@@ -697,11 +712,14 @@ namespace OmniPoss.Core
         /// </summary>
         private void UpdateTrayMenu(ApplicationConfig newConfig)
         {
-            // Update core checkmarks
+            // Update core status (running state for colored circle indicator)
             foreach (var core in newConfig.Cores)
             {
-                _trayMenu.ToggleCore(core.Key, core.Enabled && _coreManager.IsRunning(core.Key));
+                _trayMenu.ToggleCore(core.Key, _coreManager.IsRunning(core.Key));
             }
+
+            // Update StartWithWindows menu item
+            _trayMenu.ToggleStartWithWindows(newConfig.AutoStart);
 
             // Update OmniPoss and Proxy states are handled in their respective apply methods
         }
@@ -877,6 +895,55 @@ namespace OmniPoss.Core
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error during cleanup");
+            }
+        }
+
+        /// <summary>
+        /// Toggles the AutoStart setting, saves the configuration, and updates the startup shortcut.
+        /// </summary>
+        private async Task ToggleStartupAsync()
+        {
+            try
+            {
+                bool wasEnabled = _config.AutoStart;
+                _config.AutoStart = !wasEnabled;
+
+                _logger.LogInformation("Toggling AutoStart: {OldState} -> {NewState}", wasEnabled ? "Enabled" : "Disabled", _config.AutoStart ? "Enabled" : "Disabled");
+
+                // Save configuration to file
+                await SaveConfigAsync();
+
+                // Update startup shortcut
+                OmniPoss.Program.ManageStartupShortcut(_config.AutoStart);
+
+                // Update tray menu
+                _trayMenu.ToggleStartWithWindows(_config.AutoStart);
+
+                _logger.LogInformation("AutoStart toggled successfully to {State}", _config.AutoStart ? "Enabled" : "Disabled");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to toggle AutoStart");
+                // Revert the change on error
+                _config.AutoStart = !_config.AutoStart;
+            }
+        }
+
+        /// <summary>
+        /// Saves the current configuration to the config file.
+        /// </summary>
+        private async Task SaveConfigAsync()
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(_config, Formatting.Indented);
+                await File.WriteAllTextAsync(ConfigPath, json);
+                _logger.LogInformation("Configuration saved successfully to {ConfigPath}", ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to save configuration to {ConfigPath}", ConfigPath);
+                throw;
             }
         }
 
