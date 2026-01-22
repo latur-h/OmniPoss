@@ -211,7 +211,6 @@ namespace OmniPoss.Interop
         {
             try
             {
-                _tcpControlClient = new TcpClient();
                 _ = InitializeAsync();
                 return true;
             }
@@ -229,17 +228,17 @@ namespace OmniPoss.Interop
         {
             try
             {
-                var socket = _tcpControlClient!.Client;
+                // Use optimized connection method (5 second timeout for control channel)
+                var (client, stream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 5000);
+                _tcpControlClient = client;
+                
+                // Socket options are already set by the helper, but we can verify/override if needed
+                var socket = _tcpControlClient.Client;
+                // Helper already sets NoDelay, KeepAlive, and timeouts, but we ensure they're correct
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                socket.SendTimeout = 10000;
-                socket.ReceiveTimeout = 10000;
                 
-                using (var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
-                {
-                    await _tcpControlClient.ConnectAsync(_socks5Target.Address, _socks5Target.Port).WaitAsync(connectCts.Token);
-                }
-                _tcpControlStream = _tcpControlClient.GetStream();
+                _tcpControlStream = stream;
 
                 await ProcessUdpAssociateAsync();
             }

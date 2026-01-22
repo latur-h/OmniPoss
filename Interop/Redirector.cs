@@ -56,6 +56,7 @@ namespace OmniPoss.Interop
         private static ushort _localProxyPort = 8888; // Default local proxy port
 
         private static readonly List<Delegate> _callbackDelegates = new();
+        private static readonly List<GCHandle> _callbackHandles = new(); // Keep delegates alive in release mode
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void ThreadStartCallback();
 
@@ -618,6 +619,7 @@ namespace OmniPoss.Interop
         private static readonly ConcurrentDictionary<uint, ProcessInfo> _processCache = new();
         private static readonly TimeSpan _processCacheTTL = TimeSpan.FromMinutes(5);
         private static readonly object _processCacheLock = new();
+        private static GCHandle _processCacheHandle; // Keep cache alive in release mode
 
         private struct PatternMatchResult
         {
@@ -628,6 +630,7 @@ namespace OmniPoss.Interop
 
         private static readonly ConcurrentDictionary<uint, PatternMatchResult> _patternMatchCache = new();
         private static readonly TimeSpan _patternCacheTTL = TimeSpan.FromMinutes(5);
+        private static GCHandle _patternCacheHandle; // Keep cache alive in release mode
 
         private static readonly ConcurrentQueue<Action> _logQueue = new();
         private static readonly CancellationTokenSource _logQueueCts = new();
@@ -1206,6 +1209,25 @@ namespace OmniPoss.Interop
                     _callbackDelegates.Add(udpCanReceive);
                     _callbackDelegates.Add(udpCanSend);
 
+                    // Keep delegates alive to prevent GC collection in release mode
+                    // Using Normal instead of Pinned - delegates don't need to be pinned, just kept alive
+                    _callbackHandles.Add(GCHandle.Alloc(threadStart, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(threadEnd, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpConnectRequest, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpConnected, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpClosed, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpReceive, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpSend, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpCanReceive, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(tcpCanSend, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpCreated, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpConnectRequest, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpClosed, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpReceive, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpSend, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpCanReceive, GCHandleType.Normal));
+                    _callbackHandles.Add(GCHandle.Alloc(udpCanSend, GCHandleType.Normal));
+
                     // Create IP/ICMP event handler delegates if ICMP filtering is enabled
                     IntPtr ipEventHandlerPtr = IntPtr.Zero;
                     if (_filterICMP)
@@ -1214,6 +1236,9 @@ namespace OmniPoss.Interop
                         var ipSend = new IpSendCallback(StubIpSend);
                         _callbackDelegates.Add(ipReceive);
                         _callbackDelegates.Add(ipSend);
+                        // Keep IP delegates alive to prevent GC collection
+                        _callbackHandles.Add(GCHandle.Alloc(ipReceive, GCHandleType.Normal));
+                        _callbackHandles.Add(GCHandle.Alloc(ipSend, GCHandleType.Normal));
 
                         var ipEventHandler = new NativeNetFilterApi.NF_IPEventHandler
                         {
@@ -1399,6 +1424,16 @@ namespace OmniPoss.Interop
                         throw new Exception($"Failed to apply filtering rules: {ex.Message}", ex);
                     }
 
+                    // Pin caches to prevent GC collection in release mode
+                    if (!_processCacheHandle.IsAllocated)
+                    {
+                        _processCacheHandle = GCHandle.Alloc(_processCache, GCHandleType.Normal);
+                    }
+                    if (!_patternCacheHandle.IsAllocated)
+                    {
+                        _patternCacheHandle = GCHandle.Alloc(_patternMatchCache, GCHandleType.Normal);
+                    }
+
                     StartLogProcessor();
 
                     _isInitialized = true;
@@ -1454,6 +1489,27 @@ namespace OmniPoss.Interop
                     StopLogProcessor();
                     _processCache.Clear();
                     _patternMatchCache.Clear();
+
+                    // Free GCHandles to prevent memory leaks
+                    foreach (var handle in _callbackHandles)
+                    {
+                        if (handle.IsAllocated)
+                        {
+                            handle.Free();
+                        }
+                    }
+                    _callbackHandles.Clear();
+                    _callbackDelegates.Clear();
+
+                    // Free cache handles
+                    if (_processCacheHandle.IsAllocated)
+                    {
+                        _processCacheHandle.Free();
+                    }
+                    if (_patternCacheHandle.IsAllocated)
+                    {
+                        _patternCacheHandle.Free();
+                    }
 
                     _isInitialized = false;
                     _bypassPatterns.Clear();
