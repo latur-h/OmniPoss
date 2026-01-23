@@ -28,6 +28,13 @@
     <EmbeddedResource Remove="nfsdk\**" />
     <None Remove="nfsdk\**" />
   </ItemGroup>
+    <!-- Exclude nfsdk samples and TestSample from compilation -->
+  <ItemGroup>
+    <Compile Remove="protocolfilters\**" />
+    <Content Remove="protocolfilters\**" />
+    <EmbeddedResource Remove="protocolfilters\**" />
+    <None Remove="protocolfilters\**" />
+  </ItemGroup>
 
   <!-- Copy native dependencies from Storage/v2.0 to bin/ folder in output -->
   <ItemGroup>
