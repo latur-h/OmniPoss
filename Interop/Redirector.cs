@@ -450,7 +450,17 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                if (IsPrivateAddress(remoteEndPoint.Address))
+                bool isRedirectedToProxy = false;
+                if (_tcpProxy != null && _tcpProxy.IsInitialized && _udpProxy != null)
+                {
+                    bool isLoopback = IPAddress.IsLoopback(remoteEndPoint.Address) || 
+                                     remoteEndPoint.Address.Equals(IPAddress.Loopback) || 
+                                     remoteEndPoint.Address.Equals(IPAddress.IPv6Loopback);
+                    bool portMatches = remoteEndPoint.Port == _tcpProxy.ListenPort;
+                    isRedirectedToProxy = isLoopback && portMatches;
+                }
+
+                if (!isRedirectedToProxy && IsPrivateAddress(remoteEndPoint.Address))
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                     _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));

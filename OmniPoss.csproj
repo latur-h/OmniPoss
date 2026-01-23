@@ -28,7 +28,7 @@
     <EmbeddedResource Remove="nfsdk\**" />
     <None Remove="nfsdk\**" />
   </ItemGroup>
-    <!-- Exclude nfsdk samples and TestSample from compilation -->
+    <!-- Exclude protocolfilters samples and TestSample from compilation -->
   <ItemGroup>
     <Compile Remove="protocolfilters\**" />
     <Content Remove="protocolfilters\**" />
