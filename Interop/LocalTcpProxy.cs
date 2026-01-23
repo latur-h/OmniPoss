@@ -54,11 +54,7 @@ namespace OmniPoss.Interop
         public bool GetRemoteAddress(IPEndPoint remoteEndPoint, out NativeNetFilterApi.NF_TCP_CONN_INFO connInfo)
         {
             ushort port = (ushort)remoteEndPoint.Port;
-            if (_connInfoMap.TryRemove(port, out connInfo))
-            {
-                return true;
-            }
-            return false;
+            return _connInfoMap.TryRemove(port, out connInfo);
         }
 
         /// <summary>
@@ -103,8 +99,6 @@ namespace OmniPoss.Interop
             _socks5Username = username;
             _socks5Password = password;
 
-            _ = PreWarmConnectionAsync();
-
             try
             {
                 try
@@ -142,6 +136,9 @@ namespace OmniPoss.Interop
                 }
 
                 _isInitialized = true;
+
+                _ = PreWarmConnectionAsync();
+
                 return true;
             }
             catch (Exception ex)
@@ -165,6 +162,7 @@ namespace OmniPoss.Interop
                 try
                 {
                     var client = await listener.AcceptTcpClientAsync();
+
                     if (client == null)
                         continue;
 
@@ -206,25 +204,18 @@ namespace OmniPoss.Interop
             {
                 if (_cancellationTokenSource.Token.IsCancellationRequested || _socks5Target == null)
                     return;
-                
-                // Create a test connection to warm up the connection path
-                // Use shorter timeout for localhost (should be instant)
-                var (testClient, testStream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 500);
-                
-                // Immediately close the test connection - we just wanted to warm up the path
+
+                var (testClient, testStream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 200);
+
                 try
                 {
                     testStream?.Close();
                     testClient?.Close();
                 }
                 catch { }
-                
-                Log.Debug("LocalTcpProxy: Pre-warmed connection to SOCKS5 server {Target}", _socks5Target);
             }
-            catch (Exception ex)
+            catch
             {
-                // Pre-warming is best-effort; don't fail initialization if it fails
-                Log.Debug(ex, "LocalTcpProxy: Pre-warming connection failed (non-critical)");
             }
         }
 
@@ -233,9 +224,7 @@ namespace OmniPoss.Interop
         /// </summary>
         internal async Task<(TcpClient client, NetworkStream stream)> GetSocks5ConnectionAsync()
         {
-            // Use WSAConnectByNameW for faster connection establishment (Windows-optimized)
-            // Use 500ms timeout for localhost connections (should be instant)
-            return await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target!, timeoutMs: 500);
+            return await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target!, timeoutMs: 200);
         }
 
         /// <summary>
@@ -405,7 +394,7 @@ namespace OmniPoss.Interop
                 var authResponse = new byte[2];
                 using (var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+                    readCts.CancelAfter(TimeSpan.FromMilliseconds(100));
                     var bytesRead = await _socks5Stream.ReadAsync(authResponse, readCts.Token);
                     if (bytesRead < 2 || authResponse[0] != 0x05)
                     {
@@ -423,7 +412,7 @@ namespace OmniPoss.Interop
 
                     using (var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                     {
-                        readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+                        readCts.CancelAfter(TimeSpan.FromMilliseconds(100));
                         var bytesRead = await _socks5Stream.ReadAsync(authResponse, readCts.Token);
                         if (bytesRead < 2 || authResponse[0] != 0x01 || authResponse[1] != 0x00)
                         {
@@ -443,7 +432,7 @@ namespace OmniPoss.Interop
 
                 using (var connectReadCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    connectReadCts.CancelAfter(TimeSpan.FromMilliseconds(1000));
+                    connectReadCts.CancelAfter(TimeSpan.FromMilliseconds(200));
                     var connectResponse = await ReadConnectResponseAsync(connectReadCts.Token);
                     if (!connectResponse)
                     {
@@ -592,11 +581,11 @@ namespace OmniPoss.Interop
             byte[] request;
             if (!string.IsNullOrEmpty(_username))
             {
-                request = new byte[] { 0x05, 0x01, 0x02 };
+                request = [0x05, 0x01, 0x02];
             }
             else
             {
-                request = new byte[] { 0x05, 0x01, 0x00 };
+                request = [0x05, 0x01, 0x00];
             }
             await _socks5Stream!.WriteAsync(request);
         }

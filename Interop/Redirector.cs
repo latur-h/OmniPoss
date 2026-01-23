@@ -47,7 +47,7 @@ namespace OmniPoss.Interop
         private static long _uploadBytes = 0;
         private static long _downloadBytes = 0;
         private static readonly object _statsLock = new();
-        
+
         // Track per-connection manual byte counts to avoid double-counting with NF stats
         private static readonly ConcurrentDictionary<ulong, (long upload, long download)> _connectionManualStats = new();
 
@@ -137,7 +137,6 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                var processName = GetProcessName(pConnInfo.processId);
                 var processId = pConnInfo.processId;
                 var processIdCopy = processId;
 
@@ -185,7 +184,7 @@ namespace OmniPoss.Interop
                     IPAddress localProxyIp = pConnInfo.ip_family == AF_INET6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
                     var localProxyAddr = NativeNetFilterApi.CreateSockAddr(localProxyIp, localProxyPort);
                     var originalRemoteAddr = (byte[])pConnInfo.remoteAddress.Clone();
-                    
+
                     Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
                     pConnInfo.ip_family = (ushort)(localProxyIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET);
                     pConnInfo.processId = (uint)Environment.ProcessId;
@@ -221,7 +220,7 @@ namespace OmniPoss.Interop
             try
             {
                 bool usedNfStats = false;
-                
+
                 try
                 {
                     var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
@@ -340,7 +339,7 @@ namespace OmniPoss.Interop
             try
             {
                 bool usedNfStats = false;
-                
+
                 try
                 {
                     var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
@@ -453,8 +452,8 @@ namespace OmniPoss.Interop
                 bool isRedirectedToProxy = false;
                 if (_tcpProxy != null && _tcpProxy.IsInitialized && _udpProxy != null)
                 {
-                    bool isLoopback = IPAddress.IsLoopback(remoteEndPoint.Address) || 
-                                     remoteEndPoint.Address.Equals(IPAddress.Loopback) || 
+                    bool isLoopback = IPAddress.IsLoopback(remoteEndPoint.Address) ||
+                                     remoteEndPoint.Address.Equals(IPAddress.Loopback) ||
                                      remoteEndPoint.Address.Equals(IPAddress.IPv6Loopback);
                     bool portMatches = remoteEndPoint.Port == _tcpProxy.ListenPort;
                     isRedirectedToProxy = isLoopback && portMatches;
@@ -929,12 +928,12 @@ namespace OmniPoss.Interop
             string normalizedText = text;
             string normalizedPattern = pattern;
 
-            if (normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && 
+            if (normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
                 !normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 normalizedPattern = normalizedPattern.Substring(0, normalizedPattern.Length - 4);
             }
-            else if (normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && 
+            else if (normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
                      !normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 normalizedText = normalizedText.Substring(0, normalizedText.Length - 4);
@@ -1930,7 +1929,7 @@ namespace OmniPoss.Interop
         private static NF_RULE_EX CreateHandleRule(string processNamePattern, byte[] redirectAddr, int ipFamily, int protocol = IPPROTO_TCP)
         {
             var rule = CreateRedirectRule(redirectAddr, ipFamily, protocol);
-            
+
             string nfPattern = processNamePattern;
             if (!nfPattern.StartsWith("*", StringComparison.Ordinal))
             {

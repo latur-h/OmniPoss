@@ -88,19 +88,25 @@ namespace OmniPoss.Interop
                     return false;
                 if (!_connections.TryGetValue(id, out connection) || connection == null)
                     return false;
-                }
+            }
 
             if (!connection.IsConnected && connection.IsInitializationComplete)
             {
-                Log.Warning("LocalUdpProxy: Connection {Id} is in failed state, removing and retrying", id);
+                Log.Warning("LocalUdpProxy: Connection {Id} is in failed state (initialization completed but not connected), removing and retrying", id);
                 _connections.TryRemove(id, out var failedConnection);
                 try { failedConnection?.Dispose(); } catch { }
-                
+
                 if (!CreateProxyConnection(id))
-                    return false;
-                if (!_connections.TryGetValue(id, out connection) || connection == null)
+                {
+                    Log.Warning("LocalUdpProxy: Failed to recreate connection {Id} after failure", id);
                     return false;
                 }
+                if (!_connections.TryGetValue(id, out connection) || connection == null)
+                {
+                    Log.Warning("LocalUdpProxy: Recreated connection {Id} not found in dictionary", id);
+                    return false;
+                }
+            }
 
             connection.StoreOptions(options);
             connection.StoreOriginalRemoteAddress(originalRemoteAddress);
@@ -279,11 +285,11 @@ namespace OmniPoss.Interop
             {
                 var (client, stream) = await Socks5ConnectionHelper.CreateOptimizedConnectionAsync(_socks5Target, timeoutMs: 5000);
                 _tcpControlClient = client;
-                
+
                 var socket = _tcpControlClient.Client;
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
                 socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                
+
                 _tcpControlStream = stream;
 
                 await ProcessUdpAssociateAsync();
@@ -362,15 +368,15 @@ namespace OmniPoss.Interop
 
                 _udpRelayEndPoint = response;
                 _udpClient = new UdpClient();
-                
+
                 var udpSocket = _udpClient.Client;
                 udpSocket.SendTimeout = 10000;
                 udpSocket.ReceiveTimeout = 10000;
-                
+
                 const int bufferSize = 512 * 1024;
                 udpSocket.ReceiveBufferSize = bufferSize;
                 udpSocket.SendBufferSize = bufferSize;
-                
+
                 _udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
                 _isConnected = true;
                 _state = Socks5State.Connected;
@@ -395,6 +401,7 @@ namespace OmniPoss.Interop
             catch (Exception ex)
             {
                 Log.Error(ex, "UdpProxyConnection {Id}: Error in ProcessUdpAssociateAsync", _id);
+                _isConnected = false;
             }
         }
 
@@ -406,11 +413,11 @@ namespace OmniPoss.Interop
             byte[] request;
             if (!string.IsNullOrEmpty(_username))
             {
-                request = new byte[] { 0x05, 0x01, 0x02 };
+                request = [0x05, 0x01, 0x02];
             }
             else
             {
-                request = new byte[] { 0x05, 0x01, 0x00 };
+                request = [0x05, 0x01, 0x00];
             }
             await _tcpControlStream!.WriteAsync(request);
         }
@@ -683,7 +690,7 @@ namespace OmniPoss.Interop
                             else
                             {
                                 _consecutiveFailures++;
-                                
+
                                 if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_INVALID_ENDPOINT_ID)
                                 {
                                     _isConnected = false;
@@ -701,7 +708,7 @@ namespace OmniPoss.Interop
                                         break;
                                     }
                                 }
-                                
+
                                 Marshal.FreeHGlobal(remoteAddrPtr);
                                 Marshal.FreeHGlobal(dataPtr);
                             }
@@ -712,7 +719,7 @@ namespace OmniPoss.Interop
                             Log.Error(ex, "UdpProxyConnection {Id}: Exception posting data to NetFilter (consecutive failures: {Count})", _id, _consecutiveFailures);
                             if (remoteAddrPtr != IntPtr.Zero) Marshal.FreeHGlobal(remoteAddrPtr);
                             if (dataPtr != IntPtr.Zero) Marshal.FreeHGlobal(dataPtr);
-                            
+
                             if (_consecutiveFailures >= MaxConsecutiveFailures)
                             {
                                 _isConnected = false;
