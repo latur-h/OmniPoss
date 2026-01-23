@@ -47,6 +47,9 @@ namespace OmniPoss.Interop
         private static long _uploadBytes = 0;
         private static long _downloadBytes = 0;
         private static readonly object _statsLock = new();
+        
+        // Track per-connection manual byte counts to avoid double-counting with NF stats
+        private static readonly ConcurrentDictionary<ulong, (long upload, long download)> _connectionManualStats = new();
 
         private static LocalTcpProxy? _tcpProxy;
         private static LocalUdpProxy? _udpProxy;
@@ -136,17 +139,19 @@ namespace OmniPoss.Interop
 
                 var processName = GetProcessName(pConnInfo.processId);
                 var processId = pConnInfo.processId;
-                var ipFamily = pConnInfo.ip_family;
+                var processIdCopy = processId;
 
-                QueueLog(() => Log.Information("[TCP] Connection intercepted: ID={ConnectionId}, Process={ProcessName} (PID={ProcessId}), IPFamily={IpFamily}",
-                    id, processName, processId, ipFamily));
+                try
+                {
+                    if (NativeNetFilterApi.nf_tcpIsProxy(pConnInfo.processId))
+                    {
+                        return;
+                    }
+                }
+                catch (EntryPointNotFoundException) { }
+                catch (DllNotFoundException) { }
 
                 if (CheckBypassName(pConnInfo.processId))
-                {
-                    return;
-                }
-
-                if (_filterTCP && !CheckHandleName(pConnInfo.processId))
                 {
                     return;
                 }
@@ -174,26 +179,21 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                if (_tcpProxy != null)
-                {
-                    var connInfoCopy = pConnInfo;
-                    connInfoCopy.remoteAddress = (byte[])pConnInfo.remoteAddress.Clone();
-                    connInfoCopy.localAddress = (byte[])pConnInfo.localAddress.Clone();
-                    _tcpProxy.SetConnInfo(connInfoCopy);
-                }
-
                 if (_tcpProxy != null && _tcpProxy.IsInitialized)
                 {
                     var localProxyPort = _tcpProxy.ListenPort;
                     IPAddress localProxyIp = pConnInfo.ip_family == AF_INET6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
-
                     var localProxyAddr = NativeNetFilterApi.CreateSockAddr(localProxyIp, localProxyPort);
+                    var originalRemoteAddr = (byte[])pConnInfo.remoteAddress.Clone();
+                    
                     Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
                     pConnInfo.ip_family = (ushort)(localProxyIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET);
                     pConnInfo.processId = (uint)Environment.ProcessId;
 
-                    QueueLog(() => Log.Information("[TCP] Redirected to local proxy: Connection {ConnectionId}, {OriginalIp}:{OriginalPort} -> localhost:{LocalProxyPort}, Process={ProcessName}",
-                        id, originalIp, originalPort, localProxyPort, processName));
+                    var connInfoCopy = pConnInfo;
+                    connInfoCopy.remoteAddress = originalRemoteAddr;
+                    connInfoCopy.localAddress = (byte[])pConnInfo.localAddress.Clone();
+                    _tcpProxy.SetConnInfo(connInfoCopy);
                 }
                 else
                 {
@@ -209,36 +209,60 @@ namespace OmniPoss.Interop
         /// <summary>
         /// TCP connection established callback.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="pConnInfo">Connection information.</param>
         private static void StubTcpConnected(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
         }
 
         /// <summary>
-        /// TCP connection closed callback.
+        /// TCP connection closed callback. Retrieves final statistics.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="pConnInfo">Connection information.</param>
         private static void StubTcpClosed(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
+            try
+            {
+                bool usedNfStats = false;
+                
+                try
+                {
+                    var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
+                    var status = NativeNetFilterApi.nf_getTCPStat(id, ref stat);
+                    if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
+                    {
+                        lock (_statsLock)
+                        {
+                            _downloadBytes += (long)stat.bytesIn;
+                            _uploadBytes += (long)stat.bytesOut;
+                        }
+                        usedNfStats = true;
+                    }
+                }
+                catch (EntryPointNotFoundException) { }
+                catch (DllNotFoundException) { }
+
+                if (!usedNfStats && _connectionManualStats.TryRemove(id, out var manualStats))
+                {
+                    lock (_statsLock)
+                    {
+                        _downloadBytes += manualStats.download;
+                        _uploadBytes += manualStats.upload;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                QueueLog(() => Log.Error(ex, "[TCP] TcpClosed ERROR for connection {ConnectionId}", id));
+            }
         }
 
         /// <summary>
-        /// TCP receive callback. Posts received data back to NetFilter and tracks download statistics.
+        /// TCP receive callback. Posts received data back to NetFilter.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="buf">Buffer containing received data.</param>
-        /// <param name="len">Data length.</param>
         private static void StubTcpReceive(ulong id, IntPtr buf, int len)
         {
             try
             {
                 nf_tcpPostReceive(id, buf, len);
-                lock (_statsLock)
-                {
-                    _downloadBytes += len;
-                }
+                _connectionManualStats.AddOrUpdate(id, (0, len), (key, existing) => (existing.upload, existing.download + len));
             }
             catch (Exception ex)
             {
@@ -247,20 +271,14 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// TCP send callback. Posts sent data back to NetFilter and tracks upload statistics.
+        /// TCP send callback. Posts sent data back to NetFilter.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="buf">Buffer containing data to send.</param>
-        /// <param name="len">Data length.</param>
         private static void StubTcpSend(ulong id, IntPtr buf, int len)
         {
             try
             {
                 nf_tcpPostSend(id, buf, len);
-                lock (_statsLock)
-                {
-                    _uploadBytes += len;
-                }
+                _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
             }
             catch (Exception ex)
             {
@@ -291,17 +309,10 @@ namespace OmniPoss.Interop
             {
                 if (_filterParent && pConnInfo.processId == Environment.ProcessId)
                 {
-                    var processId = pConnInfo.processId;
-                    QueueLog(() => Log.Debug("[UDP] Bypassing parent process: Connection {ConnectionId}, PID={ProcessId}", id, processId));
                     return;
                 }
 
                 if (CheckBypassName(pConnInfo.processId))
-                {
-                    return;
-                }
-
-                if (_filterUDP && !CheckHandleName(pConnInfo.processId))
                 {
                     return;
                 }
@@ -322,32 +333,59 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// UDP connection closed callback. Cleans up UDP proxy connection.
+        /// UDP connection closed callback. Retrieves final statistics and cleans up UDP proxy connection.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="pConnInfo">Connection information.</param>
         private static void StubUdpClosed(ulong id, ref NativeNetFilterApi.NF_UDP_CONN_INFO pConnInfo)
         {
-            _udpProxy?.DeleteProxyConnection(id);
+            try
+            {
+                bool usedNfStats = false;
+                
+                try
+                {
+                    var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
+                    var status = NativeNetFilterApi.nf_getUDPStat(id, ref stat);
+                    if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
+                    {
+                        lock (_statsLock)
+                        {
+                            _downloadBytes += (long)stat.bytesIn;
+                            _uploadBytes += (long)stat.bytesOut;
+                        }
+                        usedNfStats = true;
+                    }
+                }
+                catch (EntryPointNotFoundException) { }
+                catch (DllNotFoundException) { }
+
+                if (!usedNfStats && _connectionManualStats.TryRemove(id, out var manualStats))
+                {
+                    lock (_statsLock)
+                    {
+                        _downloadBytes += manualStats.download;
+                        _uploadBytes += manualStats.upload;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                QueueLog(() => Log.Error(ex, "[UDP] UdpClosed ERROR for connection {ConnectionId}", id));
+            }
+            finally
+            {
+                _udpProxy?.DeleteProxyConnection(id);
+            }
         }
 
         /// <summary>
-        /// UDP receive callback. Posts received data back to NetFilter and tracks download statistics.
+        /// UDP receive callback. Posts received data back to NetFilter.
         /// </summary>
-        /// <param name="id">Connection ID.</param>
-        /// <param name="remoteAddress">Remote address sockaddr structure.</param>
-        /// <param name="buf">Buffer containing received data.</param>
-        /// <param name="len">Data length.</param>
-        /// <param name="options">UDP options pointer.</param>
         private static void StubUdpReceive(ulong id, IntPtr remoteAddress, IntPtr buf, int len, IntPtr options)
         {
             try
             {
                 NativeNetFilterApi.nf_udpPostReceive(id, remoteAddress, buf, len, options);
-                lock (_statsLock)
-                {
-                    _downloadBytes += len;
-                }
+                _connectionManualStats.AddOrUpdate(id, (0, len), (key, existing) => (existing.upload, existing.download + len));
             }
             catch (Exception ex)
             {
@@ -393,42 +431,29 @@ namespace OmniPoss.Interop
                         Marshal.Copy(buf, data, 0, len);
                         if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
                         {
-                            lock (_statsLock)
-                            {
-                                _uploadBytes += len;
-                            }
+                            _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                             return;
                         }
                     }
                     else
                     {
                         NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                        lock (_statsLock)
-                        {
-                            _uploadBytes += len;
-                        }
+                        _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                         return;
                     }
                 }
 
                 if (remoteEndPoint == null)
                 {
-                    QueueLog(() => Log.Warning("[UDP] Could not extract remote endpoint: Connection {ConnectionId}", id));
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    lock (_statsLock)
-                    {
-                        _uploadBytes += len;
-                    }
+                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                     return;
                 }
 
                 if (IsPrivateAddress(remoteEndPoint.Address))
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    lock (_statsLock)
-                    {
-                        _uploadBytes += len;
-                    }
+                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                     return;
                 }
 
@@ -439,20 +464,13 @@ namespace OmniPoss.Interop
 
                     if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
                     {
-                        lock (_statsLock)
-                        {
-                            _uploadBytes += len;
-                        }
+                        _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                         return;
                     }
                 }
 
-                QueueLog(() => Log.Warning("[UDP] Proxy send failed, allowing direct send: Connection {ConnectionId}", id));
                 NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                lock (_statsLock)
-                {
-                    _uploadBytes += len;
-                }
+                _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
             }
             catch (Exception ex)
             {
@@ -460,10 +478,7 @@ namespace OmniPoss.Interop
                 try
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    lock (_statsLock)
-                    {
-                        _uploadBytes += len;
-                    }
+                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                 }
                 catch { }
             }
@@ -612,9 +627,8 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Gets process name from process ID with caching to avoid slow lookups in callbacks.
+        /// Uses NF kernel function which doesn't require admin privileges.
         /// </summary>
-        /// <param name="processId">Process ID.</param>
-        /// <returns>Process name or "PID:{id}" if lookup fails.</returns>
         private static string GetProcessName(uint processId)
         {
             if (processId == 0) return "Unknown";
@@ -630,17 +644,47 @@ namespace OmniPoss.Interop
 
             try
             {
-                var process = Process.GetProcessById((int)processId);
-                var processName = process.ProcessName;
+                var nameBuf = new System.Text.StringBuilder(260);
+                bool success = false;
 
-                string? processPath = null;
                 try
                 {
-                    processPath = process.MainModule?.FileName;
+                    success = NativeNetFilterApi.nf_getProcessNameFromKernel(processId, nameBuf, 260);
                 }
-                catch
+                catch (EntryPointNotFoundException) { }
+                catch (DllNotFoundException) { }
+
+                if (!success)
                 {
-                    processPath = processName;
+                    try
+                    {
+                        success = NativeNetFilterApi.nf_getProcessNameW(processId, nameBuf, 260);
+                    }
+                    catch (EntryPointNotFoundException) { }
+                    catch (DllNotFoundException) { }
+                }
+
+                string processName;
+                string? processPath = null;
+
+                if (success && nameBuf.Length > 0)
+                {
+                    processPath = nameBuf.ToString();
+                    processName = Path.GetFileNameWithoutExtension(processPath);
+                }
+                else
+                {
+                    // Final fallback to Process.GetProcessById (requires admin)
+                    var process = Process.GetProcessById((int)processId);
+                    processName = process.ProcessName;
+                    try
+                    {
+                        processPath = process.MainModule?.FileName;
+                    }
+                    catch
+                    {
+                        processPath = processName;
+                    }
                 }
 
                 var info = new ProcessInfo
@@ -679,9 +723,8 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Gets full process path from process ID with caching to avoid slow MainModule lookups.
+        /// Uses NF kernel function which doesn't require admin privileges.
         /// </summary>
-        /// <param name="processId">Process ID.</param>
-        /// <returns>Full process path or "PID:{id}" if lookup fails.</returns>
         private static string GetProcessPath(uint processId)
         {
             if (processId == 0) return "Unknown";
@@ -697,17 +740,47 @@ namespace OmniPoss.Interop
 
             try
             {
-                var process = Process.GetProcessById((int)processId);
-                string? processPath = null;
-                string processName = process.ProcessName;
+                var nameBuf = new System.Text.StringBuilder(260);
+                bool success = false;
 
                 try
                 {
-                    processPath = process.MainModule?.FileName;
+                    success = NativeNetFilterApi.nf_getProcessNameFromKernel(processId, nameBuf, 260);
                 }
-                catch
+                catch (EntryPointNotFoundException) { }
+                catch (DllNotFoundException) { }
+
+                if (!success)
                 {
-                    processPath = processName;
+                    try
+                    {
+                        success = NativeNetFilterApi.nf_getProcessNameW(processId, nameBuf, 260);
+                    }
+                    catch (EntryPointNotFoundException) { }
+                    catch (DllNotFoundException) { }
+                }
+
+                string processName;
+                string? processPath = null;
+
+                if (success && nameBuf.Length > 0)
+                {
+                    processPath = nameBuf.ToString();
+                    processName = Path.GetFileNameWithoutExtension(processPath);
+                }
+                else
+                {
+                    // Final fallback to Process.GetProcessById (requires admin)
+                    var process = Process.GetProcessById((int)processId);
+                    processName = process.ProcessName;
+                    try
+                    {
+                        processPath = process.MainModule?.FileName;
+                    }
+                    catch
+                    {
+                        processPath = processName;
+                    }
                 }
 
                 var info = new ProcessInfo
@@ -836,40 +909,47 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Performs simple wildcard pattern matching (supports * and ?).
-        /// Handles .exe extension normalization for process name matching.
+        /// Handles .exe extension normalization and case-insensitive comparison.
         /// </summary>
-        /// <param name="text">Text to match against.</param>
-        /// <param name="pattern">Pattern with wildcards (* and ?).</param>
-        /// <returns>True if text matches pattern.</returns>
         private static bool MatchesPattern(string text, string pattern)
         {
             if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(pattern))
                 return false;
 
-            text = text.ToLowerInvariant();
-            pattern = pattern.ToLowerInvariant();
+            string normalizedText = text;
+            string normalizedPattern = pattern;
 
-            if (pattern.EndsWith(".exe") && !text.EndsWith(".exe"))
+            if (normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && 
+                !normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                pattern = pattern.Substring(0, pattern.Length - 4);
+                normalizedPattern = normalizedPattern.Substring(0, normalizedPattern.Length - 4);
             }
-            else if (text.EndsWith(".exe") && !pattern.EndsWith(".exe"))
+            else if (normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && 
+                     !normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                text = text.Substring(0, text.Length - 4);
+                normalizedText = normalizedText.Substring(0, normalizedText.Length - 4);
+            }
+
+            normalizedText = normalizedText.ToLowerInvariant();
+            normalizedPattern = normalizedPattern.ToLowerInvariant();
+
+            if (!normalizedPattern.Contains('*') && !normalizedPattern.Contains('?'))
+            {
+                return normalizedText == normalizedPattern;
             }
             int textIndex = 0;
             int patternIndex = 0;
             int textStar = -1;
             int patternStar = -1;
 
-            while (textIndex < text.Length)
+            while (textIndex < normalizedText.Length)
             {
-                if (patternIndex < pattern.Length && (pattern[patternIndex] == '?' || pattern[patternIndex] == text[textIndex]))
+                if (patternIndex < normalizedPattern.Length && (normalizedPattern[patternIndex] == '?' || normalizedPattern[patternIndex] == normalizedText[textIndex]))
                 {
                     textIndex++;
                     patternIndex++;
                 }
-                else if (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+                else if (patternIndex < normalizedPattern.Length && normalizedPattern[patternIndex] == '*')
                 {
                     textStar = textIndex;
                     patternStar = patternIndex;
@@ -887,10 +967,10 @@ namespace OmniPoss.Interop
                 }
             }
 
-            while (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+            while (patternIndex < normalizedPattern.Length && normalizedPattern[patternIndex] == '*')
                 patternIndex++;
 
-            return patternIndex == pattern.Length;
+            return patternIndex == normalizedPattern.Length;
         }
 
         /// <summary>
@@ -1565,8 +1645,6 @@ namespace OmniPoss.Interop
         /// </summary>
         private static void ApplyRules()
         {
-            Log.Information("[Rules] Starting rule application: Target={TargetHost}:{TargetPort}, FilterLoopback={FilterLoopback}, FilterIntranet={FilterIntranet}",
-                _targetHost, _targetPort, _filterLoopback, _filterIntranet);
             nf_deleteRules();
 
             if (string.IsNullOrEmpty(_targetHost) || _targetPort <= 0)
@@ -1577,16 +1655,20 @@ namespace OmniPoss.Interop
 
             try
             {
-                var targetIp = IPAddress.Parse(_targetHost);
-                var redirectAddr = NativeNetFilterApi.CreateSockAddr(targetIp, _targetPort);
-                var ipFamily = targetIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET;
+                if (_tcpProxy == null || !_tcpProxy.IsInitialized)
+                {
+                    Log.Warning("[Rules] Local proxy not initialized! Cannot create redirect rules.");
+                    return;
+                }
 
-                Log.Information("[Rules] Creating redirect rule: Target={TargetIp}:{TargetPort}, IPFamily={IpFamily}, HandlePatterns={HandleCount}, BypassPatterns={BypassCount}",
-                    targetIp, _targetPort, ipFamily, _handlePatterns.Count, _bypassPatterns.Count);
+                var localProxyPort = _tcpProxy.ListenPort;
+                IPAddress localProxyIp = IPAddress.Loopback;
+                var redirectAddr = NativeNetFilterApi.CreateSockAddr(localProxyIp, localProxyPort);
+                var redirectAddrV6 = NativeNetFilterApi.CreateSockAddr(IPAddress.IPv6Loopback, localProxyPort);
+
 
                 if (!_filterLoopback)
                 {
-                    Log.Information("[Rules] Adding FilterLoopback bypass rules for 127.0.0.1/8");
                     var loopbackRuleV4 = CreateBypassRuleForNetwork(IPAddress.Parse("127.0.0.1"), IPAddress.Parse("255.0.0.0"), AF_INET, IPPROTO_TCP);
                     var loopbackRuleV4Copy = loopbackRuleV4;
                     nf_addRuleEx(ref loopbackRuleV4Copy, 1);
@@ -1606,7 +1688,6 @@ namespace OmniPoss.Interop
 
                 if (!_filterIntranet)
                 {
-                    Log.Information("[Rules] Adding FilterIntranet bypass rules for private network ranges");
                     var intranetRanges = new[]
                     {
                         (IPAddress.Parse("10.0.0.0"), IPAddress.Parse("255.0.0.0")),
@@ -1632,7 +1713,6 @@ namespace OmniPoss.Interop
 
                 if (_filterICMP)
                 {
-                    Log.Information("[Rules] Adding ICMP filtering rule (delay: {Delay}ms)", _icmpDelay);
                     var icmpRuleV4 = CreateIcmpRule(AF_INET);
                     var icmpRuleV4Copy = icmpRuleV4;
                     nf_addRuleEx(ref icmpRuleV4Copy, 0);
@@ -1663,14 +1743,13 @@ namespace OmniPoss.Interop
 
                 if (_handlePatterns.Count > 0)
                 {
-                    Log.Information("[Rules] Creating {Count} handle rules for process filtering (TCP and UDP)", _handlePatterns.Count);
                     foreach (var pattern in _handlePatterns)
                     {
                         var handleRuleV4 = CreateHandleRule(pattern, redirectAddr, AF_INET, IPPROTO_TCP);
                         var handleCopyV4 = handleRuleV4;
                         nf_addRuleEx(ref handleCopyV4, 1);
 
-                        var handleRuleV6 = CreateHandleRule(pattern, redirectAddr, AF_INET6, IPPROTO_TCP);
+                        var handleRuleV6 = CreateHandleRule(pattern, redirectAddrV6, AF_INET6, IPPROTO_TCP);
                         var handleCopyV6 = handleRuleV6;
                         nf_addRuleEx(ref handleCopyV6, 1);
 
@@ -1678,39 +1757,29 @@ namespace OmniPoss.Interop
                         var handleUdpCopyV4 = handleUdpRuleV4;
                         nf_addRuleEx(ref handleUdpCopyV4, 1);
 
-                        var handleUdpRuleV6 = CreateHandleRule(pattern, redirectAddr, AF_INET6, IPPROTO_UDP);
+                        var handleUdpRuleV6 = CreateHandleRule(pattern, redirectAddrV6, AF_INET6, IPPROTO_UDP);
                         var handleUdpCopyV6 = handleUdpRuleV6;
                         nf_addRuleEx(ref handleUdpCopyV6, 1);
 
-                        Log.Information("[Rules] Added handle rule for process: {ProcessPattern} (TCP and UDP)", pattern);
                     }
                 }
                 else
                 {
-                    Log.Information("[Rules] No handle patterns defined - creating main redirect rule for all processes");
                     var mainRuleV4 = CreateRedirectRule(redirectAddr, AF_INET, IPPROTO_TCP);
                     var ruleCopyV4 = mainRuleV4;
-                    var resultV4 = nf_addRuleEx(ref ruleCopyV4, 0);
-                    Log.Information("[Rules] IPv4 TCP redirect rule added: Result={Result}", resultV4);
+                    nf_addRuleEx(ref ruleCopyV4, 0);
 
-                    if (ipFamily == AF_INET6 || targetIp.AddressFamily == AddressFamily.InterNetworkV6)
-                    {
-                        var mainRuleV6 = CreateRedirectRule(redirectAddr, AF_INET6, IPPROTO_TCP);
-                        var ruleCopyV6 = mainRuleV6;
-                        nf_addRuleEx(ref ruleCopyV6, 0);
-                    }
+                    var mainRuleV6 = CreateRedirectRule(redirectAddrV6, AF_INET6, IPPROTO_TCP);
+                    var ruleCopyV6 = mainRuleV6;
+                    nf_addRuleEx(ref ruleCopyV6, 0);
 
                     var mainUdpRuleV4 = CreateRedirectRule(redirectAddr, AF_INET, IPPROTO_UDP);
                     var udpRuleCopyV4 = mainUdpRuleV4;
                     nf_addRuleEx(ref udpRuleCopyV4, 0);
-                    Log.Information("[Rules] IPv4 UDP redirect rule added");
 
-                    if (ipFamily == AF_INET6 || targetIp.AddressFamily == AddressFamily.InterNetworkV6)
-                    {
-                        var mainUdpRuleV6 = CreateRedirectRule(redirectAddr, AF_INET6, IPPROTO_UDP);
-                        var udpRuleCopyV6 = mainUdpRuleV6;
-                        nf_addRuleEx(ref udpRuleCopyV6, 0);
-                    }
+                    var mainUdpRuleV6 = CreateRedirectRule(redirectAddrV6, AF_INET6, IPPROTO_UDP);
+                    var udpRuleCopyV6 = mainUdpRuleV6;
+                    nf_addRuleEx(ref udpRuleCopyV6, 0);
                 }
             }
             catch (Exception ex)
@@ -1757,6 +1826,11 @@ namespace OmniPoss.Interop
                 redirectTo = new byte[NF_MAX_ADDRESS_LENGTH],
                 localProxyProcessId = _localProxyProcessId
             };
+
+            if (redirectAddr != null && redirectAddr.Length > 0)
+            {
+                Array.Copy(redirectAddr, 0, rule.redirectTo, 0, Math.Min(redirectAddr.Length, rule.redirectTo.Length));
+            }
 
             return rule;
         }
@@ -1841,16 +1915,18 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Creates a handle rule for processes matching the specified pattern.
+        /// NF driver matches process names at kernel level using tail matching.
         /// </summary>
-        /// <param name="processNamePattern">Process name pattern to match.</param>
-        /// <param name="redirectAddr">Target address to redirect to.</param>
-        /// <param name="ipFamily">IP address family (AF_INET or AF_INET6).</param>
-        /// <param name="protocol">Protocol (IPPROTO_TCP or IPPROTO_UDP).</param>
-        /// <returns>Configured NF_RULE_EX structure.</returns>
         private static NF_RULE_EX CreateHandleRule(string processNamePattern, byte[] redirectAddr, int ipFamily, int protocol = IPPROTO_TCP)
         {
             var rule = CreateRedirectRule(redirectAddr, ipFamily, protocol);
-            rule.processName = processNamePattern;
+            
+            string nfPattern = processNamePattern;
+            if (!nfPattern.StartsWith("*", StringComparison.Ordinal))
+            {
+                nfPattern = "*" + nfPattern;
+            }
+            rule.processName = nfPattern;
             return rule;
         }
 
@@ -1980,7 +2056,6 @@ namespace OmniPoss.Interop
             if (config == null)
                 throw new ArgumentNullException(nameof(config));
 
-            Log.Information("[Config] Applying NFConfig to Redirector...");
 
             Dial(NameList.AIO_FILTERLOOPBACK, config.FilterLoopback);
             Dial(NameList.AIO_FILTERINTRANET, config.FilterIntranet);
@@ -2016,7 +2091,6 @@ namespace OmniPoss.Interop
 
                     Dial(NameList.AIO_DNSHOST, dnsHost);
                     Dial(NameList.AIO_DNSPORT, dnsPort.ToString());
-                    Log.Information("[Config] DNS server configured: {DnsHost}:{DnsPort}", dnsHost, dnsPort);
                 }
                 catch (Exception ex)
                 {
@@ -2027,44 +2101,36 @@ namespace OmniPoss.Interop
             if (config.ICMPDelay.HasValue)
             {
                 Dial(NameList.AIO_ICMPING, config.ICMPDelay.Value.ToString());
-                Log.Information("[Config] ICMP delay configured: {Delay}ms", config.ICMPDelay.Value);
             }
 
             if (config.LocalProxyPort.HasValue)
             {
                 Dial(NameList.AIO_LOCALPROXYPORT, config.LocalProxyPort.Value.ToString());
-                Log.Information("[Config] Local proxy port configured: {Port}", config.LocalProxyPort.Value);
             }
 
             Dial(NameList.AIO_CLRNAME, "");
 
             if (config.Bypass != null && config.Bypass.Count > 0)
             {
-                Log.Information("[Config] Adding {Count} bypass patterns", config.Bypass.Count);
                 foreach (var pattern in config.Bypass)
                 {
                     if (!string.IsNullOrEmpty(pattern))
                     {
                         Dial(NameList.AIO_BYPNAME, pattern);
-                        Log.Debug("[Config] Added bypass pattern: {Pattern}", pattern);
                     }
                 }
             }
 
             if (config.Handle != null && config.Handle.Count > 0)
             {
-                Log.Information("[Config] Adding {Count} handle patterns", config.Handle.Count);
                 foreach (var pattern in config.Handle)
                 {
                     if (!string.IsNullOrEmpty(pattern))
                     {
                         Dial(NameList.AIO_ADDNAME, pattern);
-                        Log.Debug("[Config] Added handle pattern: {Pattern}", pattern);
                     }
                 }
             }
-
-            Log.Information("[Config] NFConfig applied successfully");
         }
     }
 }

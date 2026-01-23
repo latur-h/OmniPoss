@@ -198,6 +198,25 @@ namespace OmniPoss.Infrastructure.Interop
             }
         }
 
+        // UDP options structure
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct NF_UDP_OPTIONS
+        {
+            public uint flags;
+            public uint interfaceIndex;
+            public uint subInterfaceIndex;
+            public uint controlDataLength;
+            public IntPtr controlData;
+        }
+
+        // Flow control statistics structure
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct NF_FLOWCTL_STAT
+        {
+            public ulong bytesIn;
+            public ulong bytesOut;
+        }
+
         // Event handler structure (C API)
         // Pack = 1 ensures proper alignment for native code
         // Sequential layout matches the C structure exactly
@@ -280,6 +299,51 @@ namespace OmniPoss.Infrastructure.Interop
 
         [DllImport(NfApiDll, EntryPoint = "nf_setIPEventHandler", CallingConvention = CallingConvention.Cdecl)]
         public static extern void nf_setIPEventHandler(IntPtr pHandler);
+
+        // TCP additional functions
+        [DllImport(NfApiDll, EntryPoint = "nf_getTCPConnInfo", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_getTCPConnInfo(ulong id, ref NF_TCP_CONN_INFO pConnInfo);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_completeTCPConnectRequest", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_completeTCPConnectRequest(ulong id, ref NF_TCP_CONN_INFO pConnInfo);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_findOriginalRemoteAddress", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_findOriginalRemoteAddress(ushort srcPort, IntPtr remoteAddress, int remoteAddressLen);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_tcpIsProxy", CallingConvention = CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool nf_tcpIsProxy(uint processId);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_tcpDisableFiltering", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_tcpDisableFiltering(ulong id);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_tcpSetSockOpt", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_tcpSetSockOpt(ulong id, int optname, IntPtr optval, int optlen);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_getTCPStat", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_getTCPStat(ulong id, ref NF_FLOWCTL_STAT pStat);
+
+        // UDP additional functions
+        [DllImport(NfApiDll, EntryPoint = "nf_getUDPConnInfo", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_getUDPConnInfo(ulong id, ref NF_UDP_CONN_INFO pConnInfo);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_udpSetConnectionState", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_udpSetConnectionState(ulong id, int suspended);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_udpDisableFiltering", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_udpDisableFiltering(ulong id);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_getUDPStat", CallingConvention = CallingConvention.Cdecl)]
+        public static extern NF_STATUS nf_getUDPStat(ulong id, ref NF_FLOWCTL_STAT pStat);
+
+        // Process name functions
+        [DllImport(NfApiDll, EntryPoint = "nf_getProcessNameFromKernel", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool nf_getProcessNameFromKernel(uint processId, [MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder buf, uint len);
+
+        [DllImport(NfApiDll, EntryPoint = "nf_getProcessNameW", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool nf_getProcessNameW(uint processId, [MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder buf, uint len);
 
         // Helper methods
         public static byte[] CreateSockAddr(IPAddress address, int port)
