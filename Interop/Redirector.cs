@@ -10,6 +10,7 @@ using System.Text;
 using Serilog;
 using System.Globalization;
 using System.Threading;
+using System.Buffers;
 
 namespace OmniPoss.Interop
 {
@@ -44,12 +45,6 @@ namespace OmniPoss.Interop
         private static ushort _dnsPort = 53;
         private static int _icmpDelay = 0;
 
-        private static long _uploadBytes = 0;
-        private static long _downloadBytes = 0;
-        private static readonly object _statsLock = new();
-
-        // Track per-connection manual byte counts to avoid double-counting with NF stats
-        private static readonly ConcurrentDictionary<ulong, (long upload, long download)> _connectionManualStats = new();
 
         private static LocalTcpProxy? _tcpProxy;
         private static LocalUdpProxy? _udpProxy;
@@ -147,12 +142,8 @@ namespace OmniPoss.Interop
                 catch (EntryPointNotFoundException) { }
                 catch (DllNotFoundException) { }
 
-                if (CheckBypassName(pConnInfo.processId))
-                {
-                    return;
-                }
-
                 // Fast private IP check - inline to avoid IPAddress object allocation
+                // Note: Process name filtering is handled by NetFilterSDK kernel rules, no need to check here
                 if (pConnInfo.ip_family == AF_INET && pConnInfo.remoteAddress.Length >= 8)
                 {
                     byte firstByte = pConnInfo.remoteAddress[4];
@@ -186,16 +177,34 @@ namespace OmniPoss.Interop
                     var localProxyPort = _tcpProxy.ListenPort;
                     IPAddress localProxyIp = pConnInfo.ip_family == AF_INET6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
                     var localProxyAddr = NativeNetFilterApi.CreateSockAddr(localProxyIp, localProxyPort);
-                    var originalRemoteAddr = (byte[])pConnInfo.remoteAddress.Clone();
+                    
+                    // Use ArrayPool to avoid allocations
+                    var pool = ArrayPool<byte>.Shared;
+                    var originalRemoteAddr = pool.Rent(NF_MAX_ADDRESS_LENGTH);
+                    var originalLocalAddr = pool.Rent(NF_MAX_ADDRESS_LENGTH);
+                    try
+                    {
+                        Array.Copy(pConnInfo.remoteAddress, originalRemoteAddr, Math.Min(pConnInfo.remoteAddress.Length, NF_MAX_ADDRESS_LENGTH));
+                        Array.Copy(pConnInfo.localAddress, originalLocalAddr, Math.Min(pConnInfo.localAddress.Length, NF_MAX_ADDRESS_LENGTH));
 
-                    Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
-                    pConnInfo.ip_family = (ushort)(localProxyIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET);
-                    pConnInfo.processId = (uint)Environment.ProcessId;
+                        Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
+                        pConnInfo.ip_family = (ushort)(localProxyIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET);
+                        pConnInfo.processId = (uint)Environment.ProcessId;
 
-                    var connInfoCopy = pConnInfo;
-                    connInfoCopy.remoteAddress = originalRemoteAddr;
-                    connInfoCopy.localAddress = (byte[])pConnInfo.localAddress.Clone();
-                    _tcpProxy.SetConnInfo(connInfoCopy);
+                        var connInfoCopy = pConnInfo;
+                        var remoteAddrCopy = new byte[NF_MAX_ADDRESS_LENGTH];
+                        var localAddrCopy = new byte[NF_MAX_ADDRESS_LENGTH];
+                        Array.Copy(originalRemoteAddr, remoteAddrCopy, Math.Min(originalRemoteAddr.Length, NF_MAX_ADDRESS_LENGTH));
+                        Array.Copy(originalLocalAddr, localAddrCopy, Math.Min(originalLocalAddr.Length, NF_MAX_ADDRESS_LENGTH));
+                        connInfoCopy.remoteAddress = remoteAddrCopy;
+                        connInfoCopy.localAddress = localAddrCopy;
+                        _tcpProxy.SetConnInfo(connInfoCopy);
+                    }
+                    finally
+                    {
+                        pool.Return(originalRemoteAddr);
+                        pool.Return(originalLocalAddr);
+                    }
                 }
                 else
                 {
@@ -216,44 +225,10 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// TCP connection closed callback. Retrieves final statistics.
+        /// TCP connection closed callback.
         /// </summary>
         private static void StubTcpClosed(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
-            try
-            {
-                bool usedNfStats = false;
-
-                try
-                {
-                    var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
-                    var status = NativeNetFilterApi.nf_getTCPStat(id, ref stat);
-                    if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
-                    {
-                        lock (_statsLock)
-                        {
-                            _downloadBytes += (long)stat.bytesIn;
-                            _uploadBytes += (long)stat.bytesOut;
-                        }
-                        usedNfStats = true;
-                    }
-                }
-                catch (EntryPointNotFoundException) { }
-                catch (DllNotFoundException) { }
-
-                if (!usedNfStats && _connectionManualStats.TryRemove(id, out var manualStats))
-                {
-                    lock (_statsLock)
-                    {
-                        _downloadBytes += manualStats.download;
-                        _uploadBytes += manualStats.upload;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                QueueLog(() => Log.Error(ex, "[TCP] TcpClosed ERROR for connection {ConnectionId}", id));
-            }
         }
 
         /// <summary>
@@ -264,7 +239,6 @@ namespace OmniPoss.Interop
             try
             {
                 nf_tcpPostReceive(id, buf, len);
-                _connectionManualStats.AddOrUpdate(id, (0, len), (key, existing) => (existing.upload, existing.download + len));
             }
             catch (Exception ex)
             {
@@ -280,7 +254,6 @@ namespace OmniPoss.Interop
             try
             {
                 nf_tcpPostSend(id, buf, len);
-                _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
             }
             catch (Exception ex)
             {
@@ -314,10 +287,7 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                if (CheckBypassName(pConnInfo.processId))
-                {
-                    return;
-                }
+                // Note: Process name filtering is handled by NetFilterSDK kernel rules, no need to check here
             }
             catch (Exception ex)
             {
@@ -335,47 +305,17 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// UDP connection closed callback. Retrieves final statistics and cleans up UDP proxy connection.
+        /// UDP connection closed callback. Cleans up UDP proxy connection.
         /// </summary>
         private static void StubUdpClosed(ulong id, ref NativeNetFilterApi.NF_UDP_CONN_INFO pConnInfo)
         {
             try
             {
-                bool usedNfStats = false;
-
-                try
-                {
-                    var stat = new NativeNetFilterApi.NF_FLOWCTL_STAT();
-                    var status = NativeNetFilterApi.nf_getUDPStat(id, ref stat);
-                    if (status == NativeNetFilterApi.NF_STATUS.NF_STATUS_SUCCESS)
-                    {
-                        lock (_statsLock)
-                        {
-                            _downloadBytes += (long)stat.bytesIn;
-                            _uploadBytes += (long)stat.bytesOut;
-                        }
-                        usedNfStats = true;
-                    }
-                }
-                catch (EntryPointNotFoundException) { }
-                catch (DllNotFoundException) { }
-
-                if (!usedNfStats && _connectionManualStats.TryRemove(id, out var manualStats))
-                {
-                    lock (_statsLock)
-                    {
-                        _downloadBytes += manualStats.download;
-                        _uploadBytes += manualStats.upload;
-                    }
-                }
+                _udpProxy?.DeleteProxyConnection(id);
             }
             catch (Exception ex)
             {
                 QueueLog(() => Log.Error(ex, "[UDP] UdpClosed ERROR for connection {ConnectionId}", id));
-            }
-            finally
-            {
-                _udpProxy?.DeleteProxyConnection(id);
             }
         }
 
@@ -387,7 +327,6 @@ namespace OmniPoss.Interop
             try
             {
                 NativeNetFilterApi.nf_udpPostReceive(id, remoteAddress, buf, len, options);
-                _connectionManualStats.AddOrUpdate(id, (0, len), (key, existing) => (existing.upload, existing.download + len));
             }
             catch (Exception ex)
             {
@@ -433,14 +372,12 @@ namespace OmniPoss.Interop
                         Marshal.Copy(buf, data, 0, len);
                         if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
                         {
-                            _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                             return;
                         }
                     }
                     else
                     {
                         NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                        _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                         return;
                     }
                 }
@@ -448,7 +385,6 @@ namespace OmniPoss.Interop
                 if (remoteEndPoint == null)
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                     return;
                 }
 
@@ -465,7 +401,6 @@ namespace OmniPoss.Interop
                 if (!isRedirectedToProxy && IsPrivateAddress(remoteEndPoint.Address))
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                     return;
                 }
 
@@ -476,13 +411,11 @@ namespace OmniPoss.Interop
 
                     if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
                     {
-                        _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                         return;
                     }
                 }
 
                 NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
             }
             catch (Exception ex)
             {
@@ -490,7 +423,6 @@ namespace OmniPoss.Interop
                 try
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    _connectionManualStats.AddOrUpdate(id, (len, 0), (key, existing) => (existing.upload + len, existing.download));
                 }
                 catch { }
             }
@@ -542,11 +474,6 @@ namespace OmniPoss.Interop
                             _icmpPacketTimes[packetKey] = DateTime.UtcNow;
                         }
                     }
-
-                    lock (_statsLock)
-                    {
-                        _downloadBytes += len;
-                    }
                 }
 
                 NativeNetFilterApi.nf_ipPostReceive(buf, len, options);
@@ -592,11 +519,6 @@ namespace OmniPoss.Interop
                             _icmpPacketTimes[packetKey] = DateTime.UtcNow;
                         }
                     }
-
-                    lock (_statsLock)
-                    {
-                        _uploadBytes += len;
-                    }
                 }
 
                 NativeNetFilterApi.nf_ipPostSend(buf, len, options);
@@ -609,380 +531,13 @@ namespace OmniPoss.Interop
         private static readonly List<string> _bypassPatterns = new();
         private static readonly List<string> _handlePatterns = new();
 
-        private struct ProcessInfo
-        {
-            public string Name;
-            public string Path;
-            public DateTime CachedAt;
-        }
-
-        private static readonly ConcurrentDictionary<uint, ProcessInfo> _processCache = new();
-        private static readonly TimeSpan _processCacheTTL = TimeSpan.FromMinutes(5);
-        private static GCHandle _processCacheHandle;
-
-        private struct PatternMatchResult
-        {
-            public bool ShouldHandle;
-            public bool ShouldBypass;
-            public DateTime CachedAt;
-        }
-
-        private static readonly ConcurrentDictionary<uint, PatternMatchResult> _patternMatchCache = new();
-        private static readonly TimeSpan _patternCacheTTL = TimeSpan.FromMinutes(5);
-        private static GCHandle _patternCacheHandle;
-
         private static readonly ConcurrentQueue<Action> _logQueue = new();
         private static readonly CancellationTokenSource _logQueueCts = new();
         private static Task? _logProcessorTask = null;
         private static readonly object _logProcessorLock = new();
 
-        /// <summary>
-        /// Gets process name from process ID with caching to avoid slow lookups in callbacks.
-        /// Uses NF kernel function which doesn't require admin privileges.
-        /// </summary>
-        private static string GetProcessName(uint processId)
-        {
-            if (processId == 0) return "Unknown";
-
-            if (_processCache.TryGetValue(processId, out var cachedInfo))
-            {
-                if (DateTime.UtcNow - cachedInfo.CachedAt < _processCacheTTL)
-                {
-                    return cachedInfo.Name;
-                }
-                _processCache.TryRemove(processId, out _);
-            }
-
-            try
-            {
-                var nameBuf = new System.Text.StringBuilder(260);
-                bool success = false;
-
-                try
-                {
-                    success = NativeNetFilterApi.nf_getProcessNameFromKernel(processId, nameBuf, 260);
-                }
-                catch (EntryPointNotFoundException) { }
-                catch (DllNotFoundException) { }
-
-                if (!success)
-                {
-                    try
-                    {
-                        success = NativeNetFilterApi.nf_getProcessNameW(processId, nameBuf, 260);
-                    }
-                    catch (EntryPointNotFoundException) { }
-                    catch (DllNotFoundException) { }
-                }
-
-                string processName;
-                string? processPath = null;
-
-                if (success && nameBuf.Length > 0)
-                {
-                    processPath = nameBuf.ToString();
-                    processName = Path.GetFileNameWithoutExtension(processPath);
-                }
-                else
-                {
-                    // Final fallback to Process.GetProcessById (requires admin)
-                    var process = Process.GetProcessById((int)processId);
-                    processName = process.ProcessName;
-                    try
-                    {
-                        processPath = process.MainModule?.FileName;
-                    }
-                    catch
-                    {
-                        processPath = processName;
-                    }
-                }
-
-                var info = new ProcessInfo
-                {
-                    Name = processName,
-                    Path = processPath ?? processName,
-                    CachedAt = DateTime.UtcNow
-                };
-                _processCache[processId] = info;
-
-                return processName;
-            }
-            catch (ArgumentException)
-            {
-                var failedInfo = new ProcessInfo
-                {
-                    Name = $"PID:{processId}",
-                    Path = $"PID:{processId}",
-                    CachedAt = DateTime.UtcNow
-                };
-                _processCache[processId] = failedInfo;
-                return failedInfo.Name;
-            }
-            catch (Exception)
-            {
-                var failedInfo = new ProcessInfo
-                {
-                    Name = $"PID:{processId}",
-                    Path = $"PID:{processId}",
-                    CachedAt = DateTime.UtcNow
-                };
-                _processCache[processId] = failedInfo;
-                return failedInfo.Name;
-            }
-        }
-
-        /// <summary>
-        /// Gets full process path from process ID with caching to avoid slow MainModule lookups.
-        /// Uses NF kernel function which doesn't require admin privileges.
-        /// </summary>
-        private static string GetProcessPath(uint processId)
-        {
-            if (processId == 0) return "Unknown";
-
-            if (_processCache.TryGetValue(processId, out var cachedInfo))
-            {
-                if (DateTime.UtcNow - cachedInfo.CachedAt < _processCacheTTL)
-                {
-                    return cachedInfo.Path;
-                }
-                _processCache.TryRemove(processId, out _);
-            }
-
-            try
-            {
-                var nameBuf = new System.Text.StringBuilder(260);
-                bool success = false;
-
-                try
-                {
-                    success = NativeNetFilterApi.nf_getProcessNameFromKernel(processId, nameBuf, 260);
-                }
-                catch (EntryPointNotFoundException) { }
-                catch (DllNotFoundException) { }
-
-                if (!success)
-                {
-                    try
-                    {
-                        success = NativeNetFilterApi.nf_getProcessNameW(processId, nameBuf, 260);
-                    }
-                    catch (EntryPointNotFoundException) { }
-                    catch (DllNotFoundException) { }
-                }
-
-                string processName;
-                string? processPath = null;
-
-                if (success && nameBuf.Length > 0)
-                {
-                    processPath = nameBuf.ToString();
-                    processName = Path.GetFileNameWithoutExtension(processPath);
-                }
-                else
-                {
-                    // Final fallback to Process.GetProcessById (requires admin)
-                    var process = Process.GetProcessById((int)processId);
-                    processName = process.ProcessName;
-                    try
-                    {
-                        processPath = process.MainModule?.FileName;
-                    }
-                    catch
-                    {
-                        processPath = processName;
-                    }
-                }
-
-                var info = new ProcessInfo
-                {
-                    Name = processName,
-                    Path = processPath ?? processName,
-                    CachedAt = DateTime.UtcNow
-                };
-                _processCache[processId] = info;
-
-                return info.Path;
-            }
-            catch
-            {
-                var failedInfo = new ProcessInfo
-                {
-                    Name = $"PID:{processId}",
-                    Path = $"PID:{processId}",
-                    CachedAt = DateTime.UtcNow
-                };
-                _processCache[processId] = failedInfo;
-                return failedInfo.Path;
-            }
-        }
-
-        /// <summary>
-        /// Checks if process matches handle patterns with caching to avoid repeated lookups.
-        /// </summary>
-        /// <param name="processId">Process ID to check.</param>
-        /// <returns>True if process should be handled/redirected.</returns>
-        private static bool CheckHandleName(uint processId)
-        {
-            if (_handlePatterns.Count == 0)
-                return true;
-
-            if (_patternMatchCache.TryGetValue(processId, out var cachedMatch))
-            {
-                if (DateTime.UtcNow - cachedMatch.CachedAt < _patternCacheTTL)
-                {
-                    return cachedMatch.ShouldHandle;
-                }
-                _patternMatchCache.TryRemove(processId, out _);
-            }
-
-            var processName = GetProcessName(processId);
-            var processPath = GetProcessPath(processId);
-
-            bool shouldHandle = false;
-            foreach (var pattern in _handlePatterns)
-            {
-                if (string.IsNullOrEmpty(pattern))
-                    continue;
-
-                if (MatchesPattern(processName, pattern) || MatchesPattern(processPath, pattern))
-                {
-                    shouldHandle = true;
-                    break;
-                }
-            }
-
-            var matchResult = new PatternMatchResult
-            {
-                ShouldHandle = shouldHandle,
-                ShouldBypass = false,
-                CachedAt = DateTime.UtcNow
-            };
-            _patternMatchCache[processId] = matchResult;
-
-            return shouldHandle;
-        }
-
-        /// <summary>
-        /// Checks if process matches bypass patterns with caching to avoid repeated lookups.
-        /// </summary>
-        /// <param name="processId">Process ID to check.</param>
-        /// <returns>True if process should be bypassed (not redirected).</returns>
-        private static bool CheckBypassName(uint processId)
-        {
-            if (_bypassPatterns.Count == 0)
-                return false;
-
-            if (_patternMatchCache.TryGetValue(processId, out var cachedMatch))
-            {
-                if (DateTime.UtcNow - cachedMatch.CachedAt < _patternCacheTTL && cachedMatch.ShouldBypass)
-                {
-                    return cachedMatch.ShouldBypass;
-                }
-                _patternMatchCache.TryRemove(processId, out _);
-            }
-
-            var processName = GetProcessName(processId);
-            var processPath = GetProcessPath(processId);
-
-            bool shouldBypass = false;
-            foreach (var pattern in _bypassPatterns)
-            {
-                if (string.IsNullOrEmpty(pattern))
-                    continue;
-
-                if (MatchesPattern(processName, pattern) || MatchesPattern(processPath, pattern))
-                {
-                    shouldBypass = true;
-                    break;
-                }
-            }
-
-            if (_patternMatchCache.TryGetValue(processId, out var existingMatch))
-            {
-                existingMatch.ShouldBypass = shouldBypass;
-                existingMatch.CachedAt = DateTime.UtcNow;
-                _patternMatchCache[processId] = existingMatch;
-            }
-            else
-            {
-                var matchResult = new PatternMatchResult
-                {
-                    ShouldHandle = false,
-                    ShouldBypass = shouldBypass,
-                    CachedAt = DateTime.UtcNow
-                };
-                _patternMatchCache[processId] = matchResult;
-            }
-
-            return shouldBypass;
-        }
-
-        /// <summary>
-        /// Performs simple wildcard pattern matching (supports * and ?).
-        /// Handles .exe extension normalization and case-insensitive comparison.
-        /// </summary>
-        private static bool MatchesPattern(string text, string pattern)
-        {
-            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(pattern))
-                return false;
-
-            string normalizedText = text;
-            string normalizedPattern = pattern;
-
-            if (normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
-                !normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            {
-                normalizedPattern = normalizedPattern.Substring(0, normalizedPattern.Length - 4);
-            }
-            else if (normalizedText.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) &&
-                     !normalizedPattern.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            {
-                normalizedText = normalizedText.Substring(0, normalizedText.Length - 4);
-            }
-
-            normalizedText = normalizedText.ToLowerInvariant();
-            normalizedPattern = normalizedPattern.ToLowerInvariant();
-
-            if (!normalizedPattern.Contains('*') && !normalizedPattern.Contains('?'))
-            {
-                return normalizedText == normalizedPattern;
-            }
-            int textIndex = 0;
-            int patternIndex = 0;
-            int textStar = -1;
-            int patternStar = -1;
-
-            while (textIndex < normalizedText.Length)
-            {
-                if (patternIndex < normalizedPattern.Length && (normalizedPattern[patternIndex] == '?' || normalizedPattern[patternIndex] == normalizedText[textIndex]))
-                {
-                    textIndex++;
-                    patternIndex++;
-                }
-                else if (patternIndex < normalizedPattern.Length && normalizedPattern[patternIndex] == '*')
-                {
-                    textStar = textIndex;
-                    patternStar = patternIndex;
-                    patternIndex++;
-                }
-                else if (patternStar != -1)
-                {
-                    textStar++;
-                    textIndex = textStar;
-                    patternIndex = patternStar + 1;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-
-            while (patternIndex < normalizedPattern.Length && normalizedPattern[patternIndex] == '*')
-                patternIndex++;
-
-            return patternIndex == normalizedPattern.Length;
-        }
+        // Note: Process name filtering is handled by NetFilterSDK kernel rules (NF_RULE_EX.processName)
+        // No need for callback-level process name lookups - kernel already filters based on rules
 
 
         private const int IPPROTO_TCP = 6;
@@ -1453,15 +1008,6 @@ namespace OmniPoss.Interop
                         throw new Exception($"Failed to apply filtering rules: {ex.Message}", ex);
                     }
 
-                    if (!_processCacheHandle.IsAllocated)
-                    {
-                        _processCacheHandle = GCHandle.Alloc(_processCache, GCHandleType.Normal);
-                    }
-                    if (!_patternCacheHandle.IsAllocated)
-                    {
-                        _patternCacheHandle = GCHandle.Alloc(_patternMatchCache, GCHandleType.Normal);
-                    }
-
                     StartLogProcessor();
 
                     _isInitialized = true;
@@ -1518,8 +1064,6 @@ namespace OmniPoss.Interop
                     _udpProxy = null;
 
                     StopLogProcessor();
-                    _processCache.Clear();
-                    _patternMatchCache.Clear();
 
                     foreach (var handle in _callbackHandles)
                     {
@@ -1530,15 +1074,6 @@ namespace OmniPoss.Interop
                     }
                     _callbackHandles.Clear();
                     _callbackDelegates.Clear();
-
-                    if (_processCacheHandle.IsAllocated)
-                    {
-                        _processCacheHandle.Free();
-                    }
-                    if (_patternCacheHandle.IsAllocated)
-                    {
-                        _patternCacheHandle.Free();
-                    }
 
                     _isInitialized = false;
                     _bypassPatterns.Clear();
@@ -1563,41 +1098,6 @@ namespace OmniPoss.Interop
             return true;
         }
 
-        /// <summary>
-        /// Gets the total number of bytes uploaded.
-        /// </summary>
-        /// <returns>Total upload bytes.</returns>
-        public static long GetUploadBytes()
-        {
-            lock (_statsLock)
-            {
-                return _uploadBytes;
-            }
-        }
-
-        /// <summary>
-        /// Gets the total number of bytes downloaded.
-        /// </summary>
-        /// <returns>Total download bytes.</returns>
-        public static long GetDownloadBytes()
-        {
-            lock (_statsLock)
-            {
-                return _downloadBytes;
-            }
-        }
-
-        /// <summary>
-        /// Resets upload and download statistics to zero.
-        /// </summary>
-        public static void ResetStatistics()
-        {
-            lock (_statsLock)
-            {
-                _uploadBytes = 0;
-                _downloadBytes = 0;
-            }
-        }
 
         /// <summary>
         /// Unregisters the NetFilter driver and frees resources.
