@@ -50,6 +50,14 @@ namespace OmniPoss.Interop
         private static LocalUdpProxy? _udpProxy;
         private static ushort _localProxyPort = 8888;
 
+        // Cached local proxy addresses (avoid CreateSockAddr allocation per connection)
+        private static byte[]? _cachedLocalProxyAddrV4 = null;
+        private static byte[]? _cachedLocalProxyAddrV6 = null;
+        private static ushort _cachedLocalProxyPort = 0;
+
+        // Track original UDP destinations for redirected connections
+        private static readonly ConcurrentDictionary<ulong, byte[]> _udpOriginalDestinations = new();
+
         private static readonly List<Delegate> _callbackDelegates = new();
         private static readonly List<GCHandle> _callbackHandles = new();
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -175,36 +183,34 @@ namespace OmniPoss.Interop
                 if (_tcpProxy != null && _tcpProxy.IsInitialized)
                 {
                     var localProxyPort = _tcpProxy.ListenPort;
-                    IPAddress localProxyIp = pConnInfo.ip_family == AF_INET6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
-                    var localProxyAddr = NativeNetFilterApi.CreateSockAddr(localProxyIp, localProxyPort);
                     
-                    // Use ArrayPool to avoid allocations
-                    var pool = ArrayPool<byte>.Shared;
-                    var originalRemoteAddr = pool.Rent(NF_MAX_ADDRESS_LENGTH);
-                    var originalLocalAddr = pool.Rent(NF_MAX_ADDRESS_LENGTH);
-                    try
+                    // Cache CreateSockAddr result (local proxy address doesn't change)
+                    if (_cachedLocalProxyPort != localProxyPort || _cachedLocalProxyAddrV4 == null)
                     {
-                        Array.Copy(pConnInfo.remoteAddress, originalRemoteAddr, Math.Min(pConnInfo.remoteAddress.Length, NF_MAX_ADDRESS_LENGTH));
-                        Array.Copy(pConnInfo.localAddress, originalLocalAddr, Math.Min(pConnInfo.localAddress.Length, NF_MAX_ADDRESS_LENGTH));
-
-                        Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
-                        pConnInfo.ip_family = (ushort)(localProxyIp.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET);
-                        pConnInfo.processId = (uint)Environment.ProcessId;
-
-                        var connInfoCopy = pConnInfo;
-                        var remoteAddrCopy = new byte[NF_MAX_ADDRESS_LENGTH];
-                        var localAddrCopy = new byte[NF_MAX_ADDRESS_LENGTH];
-                        Array.Copy(originalRemoteAddr, remoteAddrCopy, Math.Min(originalRemoteAddr.Length, NF_MAX_ADDRESS_LENGTH));
-                        Array.Copy(originalLocalAddr, localAddrCopy, Math.Min(originalLocalAddr.Length, NF_MAX_ADDRESS_LENGTH));
-                        connInfoCopy.remoteAddress = remoteAddrCopy;
-                        connInfoCopy.localAddress = localAddrCopy;
-                        _tcpProxy.SetConnInfo(connInfoCopy);
+                        _cachedLocalProxyAddrV4 = NativeNetFilterApi.CreateSockAddr(IPAddress.Loopback, localProxyPort);
+                        _cachedLocalProxyAddrV6 = NativeNetFilterApi.CreateSockAddr(IPAddress.IPv6Loopback, localProxyPort);
+                        _cachedLocalProxyPort = localProxyPort;
                     }
-                    finally
-                    {
-                        pool.Return(originalRemoteAddr);
-                        pool.Return(originalLocalAddr);
-                    }
+                    
+                    var localProxyAddr = pConnInfo.ip_family == AF_INET6 ? _cachedLocalProxyAddrV6! : _cachedLocalProxyAddrV4!;
+                    var isIPv6 = pConnInfo.ip_family == AF_INET6;
+                    
+                    // Save original addresses BEFORE modifying pConnInfo (copy directly to final arrays)
+                    var originalRemoteAddr = new byte[NF_MAX_ADDRESS_LENGTH];
+                    var originalLocalAddr = new byte[NF_MAX_ADDRESS_LENGTH];
+                    Array.Copy(pConnInfo.remoteAddress, originalRemoteAddr, Math.Min(pConnInfo.remoteAddress.Length, NF_MAX_ADDRESS_LENGTH));
+                    Array.Copy(pConnInfo.localAddress, originalLocalAddr, Math.Min(pConnInfo.localAddress.Length, NF_MAX_ADDRESS_LENGTH));
+
+                    // Modify pConnInfo for redirect
+                    Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
+                    pConnInfo.ip_family = (ushort)(isIPv6 ? AF_INET6 : AF_INET);
+                    pConnInfo.processId = (uint)Environment.ProcessId;
+
+                    // Create connInfoCopy with original addresses
+                    var connInfoCopy = pConnInfo;
+                    connInfoCopy.remoteAddress = originalRemoteAddr;
+                    connInfoCopy.localAddress = originalLocalAddr;
+                    _tcpProxy.SetConnInfo(connInfoCopy);
                 }
                 else
                 {
@@ -312,6 +318,7 @@ namespace OmniPoss.Interop
             try
             {
                 _udpProxy?.DeleteProxyConnection(id);
+                _udpOriginalDestinations.TryRemove(id, out _);
             }
             catch (Exception ex)
             {
@@ -344,35 +351,98 @@ namespace OmniPoss.Interop
                 byte[] remoteAddrBytes = new byte[NF_MAX_ADDRESS_LENGTH];
                 Marshal.Copy(remoteAddress, remoteAddrBytes, 0, Math.Min(NF_MAX_ADDRESS_LENGTH, remoteAddrBytes.Length));
 
-                IPEndPoint? remoteEndPoint = null;
                 ushort addrFamily = BitConverter.ToUInt16(remoteAddrBytes, 0);
                 ushort remotePort = 0;
+                bool isValidAddress = false;
 
                 if (addrFamily == AF_INET && remoteAddrBytes.Length >= 8)
                 {
                     remotePort = BitConverter.ToUInt16(remoteAddrBytes, 2);
                     remotePort = (ushort)IPAddress.NetworkToHostOrder((short)remotePort);
-                    uint ipAddr = BitConverter.ToUInt32(remoteAddrBytes, 4);
-                    remoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), remotePort);
+                    isValidAddress = true;
                 }
                 else if (addrFamily == AF_INET6 && remoteAddrBytes.Length >= 24)
                 {
                     remotePort = BitConverter.ToUInt16(remoteAddrBytes, 2);
                     remotePort = (ushort)IPAddress.NetworkToHostOrder((short)remotePort);
-                    byte[] ipAddrBytes = new byte[16];
-                    Array.Copy(remoteAddrBytes, 8, ipAddrBytes, 0, 16);
-                    remoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), remotePort);
+                    isValidAddress = true;
                 }
 
+                // Fast private IP check (inline, no IPAddress allocation)
+                if (isValidAddress)
+                {
+                    if (addrFamily == AF_INET && remoteAddrBytes.Length >= 8)
+                    {
+                        byte firstByte = remoteAddrBytes[4];
+                        if (firstByte == 10 || firstByte == 127 ||
+                            (firstByte == 172 && remoteAddrBytes[5] >= 16 && remoteAddrBytes[5] <= 31) ||
+                            (firstByte == 192 && remoteAddrBytes[5] == 168))
+                        {
+                            // Private IP, bypass (unless DNS or redirected to proxy)
+                            if (remotePort != 53 || !_filterDNS)
+                            {
+                                NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
+                                return;
+                            }
+                        }
+                    }
+                    else if (addrFamily == AF_INET6 && remoteAddrBytes.Length >= 24)
+                    {
+                        // Fast IPv6 loopback check
+                        bool isLoopback = true;
+                        for (int i = 8; i < 16; i++)
+                        {
+                            if (remoteAddrBytes[i] != 0)
+                            {
+                                isLoopback = false;
+                                break;
+                            }
+                        }
+                        if (isLoopback && remoteAddrBytes[23] == 1)
+                        {
+                            // IPv6 loopback, bypass (unless DNS or redirected to proxy)
+                            if (remotePort != 53 || !_filterDNS)
+                            {
+                                NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // DNS handling
                 if (remotePort == 53 && _filterDNS)
                 {
-                    if (_dnsProxy && _udpProxy != null && remoteEndPoint != null)
+                    if (_dnsProxy && _udpProxy != null && isValidAddress)
                     {
-                        byte[] data = new byte[len];
-                        Marshal.Copy(buf, data, 0, len);
-                        if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
+                        var pool = ArrayPool<byte>.Shared;
+                        var data = pool.Rent(len);
+                        try
                         {
-                            return;
+                            Marshal.Copy(buf, data, 0, len);
+                            
+                            // Create IPEndPoint only if needed for proxy
+                            IPEndPoint? remoteEndPoint = null;
+                            if (addrFamily == AF_INET && remoteAddrBytes.Length >= 8)
+                            {
+                                uint ipAddr = BitConverter.ToUInt32(remoteAddrBytes, 4);
+                                remoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), remotePort);
+                            }
+                            else if (addrFamily == AF_INET6 && remoteAddrBytes.Length >= 24)
+                            {
+                                byte[] ipAddrBytes = new byte[16];
+                                Array.Copy(remoteAddrBytes, 8, ipAddrBytes, 0, 16);
+                                remoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), remotePort);
+                            }
+                            
+                            if (remoteEndPoint != null && _udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
+                            {
+                                return;
+                            }
+                        }
+                        finally
+                        {
+                            pool.Return(data);
                         }
                     }
                     else
@@ -382,37 +452,184 @@ namespace OmniPoss.Interop
                     }
                 }
 
-                if (remoteEndPoint == null)
+                if (!isValidAddress)
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                     return;
                 }
 
+                // Check if redirected to proxy (inline loopback check)
                 bool isRedirectedToProxy = false;
                 if (_tcpProxy != null && _tcpProxy.IsInitialized && _udpProxy != null)
                 {
-                    bool isLoopback = IPAddress.IsLoopback(remoteEndPoint.Address) ||
-                                     remoteEndPoint.Address.Equals(IPAddress.Loopback) ||
-                                     remoteEndPoint.Address.Equals(IPAddress.IPv6Loopback);
-                    bool portMatches = remoteEndPoint.Port == _tcpProxy.ListenPort;
+                    bool isLoopback = false;
+                    if (addrFamily == AF_INET && remoteAddrBytes.Length >= 8)
+                    {
+                        isLoopback = remoteAddrBytes[4] == 127 && remoteAddrBytes[5] == 0 &&
+                                     remoteAddrBytes[6] == 0 && remoteAddrBytes[7] == 1;
+                    }
+                    else if (addrFamily == AF_INET6 && remoteAddrBytes.Length >= 24)
+                    {
+                        isLoopback = true;
+                        for (int i = 8; i < 16; i++)
+                        {
+                            if (remoteAddrBytes[i] != 0)
+                            {
+                                isLoopback = false;
+                                break;
+                            }
+                        }
+                        if (isLoopback && remoteAddrBytes[23] != 1) isLoopback = false;
+                    }
+                    bool portMatches = remotePort == _tcpProxy.ListenPort;
                     isRedirectedToProxy = isLoopback && portMatches;
                 }
 
-                if (!isRedirectedToProxy && IsPrivateAddress(remoteEndPoint.Address))
+                // Redirect UDP connection to local proxy (if not already redirected)
+                if (!isRedirectedToProxy && _tcpProxy != null && _tcpProxy.IsInitialized && _udpProxy != null)
                 {
-                    NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
-                    return;
-                }
-
-                if (_udpProxy != null)
-                {
-                    byte[] data = new byte[len];
-                    Marshal.Copy(buf, data, 0, len);
-
-                    if (_udpProxy.UdpSend(id, data, len, remoteEndPoint, options, remoteAddress))
+                    // Save original remote address BEFORE redirecting
+                    var originalRemoteAddrBytes = new byte[NF_MAX_ADDRESS_LENGTH];
+                    Array.Copy(remoteAddrBytes, originalRemoteAddrBytes, Math.Min(remoteAddrBytes.Length, NF_MAX_ADDRESS_LENGTH));
+                    
+                    // Get cached local proxy address
+                    var localProxyPort = _tcpProxy.ListenPort;
+                    if (_cachedLocalProxyPort != localProxyPort || _cachedLocalProxyAddrV4 == null)
                     {
+                        _cachedLocalProxyAddrV4 = NativeNetFilterApi.CreateSockAddr(IPAddress.Loopback, localProxyPort);
+                        _cachedLocalProxyAddrV6 = NativeNetFilterApi.CreateSockAddr(IPAddress.IPv6Loopback, localProxyPort);
+                        _cachedLocalProxyPort = localProxyPort;
+                    }
+                    
+                    var localProxyAddr = addrFamily == AF_INET6 ? _cachedLocalProxyAddrV6! : _cachedLocalProxyAddrV4!;
+                    
+                    // Create/ensure UDP proxy connection exists
+                    if (!_udpProxy.CreateProxyConnection(id))
+                    {
+                        NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                         return;
                     }
+                    
+                    // Create IPEndPoint with ORIGINAL destination for proxy
+                    IPEndPoint? originalRemoteEndPoint = null;
+                    if (addrFamily == AF_INET && originalRemoteAddrBytes.Length >= 8)
+                    {
+                        ushort origPort = BitConverter.ToUInt16(originalRemoteAddrBytes, 2);
+                        origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
+                        uint ipAddr = BitConverter.ToUInt32(originalRemoteAddrBytes, 4);
+                        originalRemoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), origPort);
+                    }
+                    else if (addrFamily == AF_INET6 && originalRemoteAddrBytes.Length >= 24)
+                    {
+                        ushort origPort = BitConverter.ToUInt16(originalRemoteAddrBytes, 2);
+                        origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
+                        byte[] ipAddrBytes = new byte[16];
+                        Array.Copy(originalRemoteAddrBytes, 8, ipAddrBytes, 0, 16);
+                        originalRemoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), origPort);
+                    }
+                    
+                    if (originalRemoteEndPoint == null)
+                    {
+                        NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
+                        return;
+                    }
+                    
+                    // Store original destination for this connection
+                    _udpOriginalDestinations[id] = originalRemoteAddrBytes;
+                    
+                    // Create IntPtr for original address (for proxy to store)
+                    IntPtr originalRemoteAddrPtr = Marshal.AllocHGlobal(NF_MAX_ADDRESS_LENGTH);
+                    try
+                    {
+                        Marshal.Copy(originalRemoteAddrBytes, 0, originalRemoteAddrPtr, NF_MAX_ADDRESS_LENGTH);
+                        
+                        // Modify remoteAddress to redirect to local proxy (for NetFilter tracking)
+                        Marshal.Copy(localProxyAddr, 0, remoteAddress, Math.Min(localProxyAddr.Length, NF_MAX_ADDRESS_LENGTH));
+                        
+                        // Send through proxy with ORIGINAL destination (proxy sends via SOCKS5)
+                        var pool = ArrayPool<byte>.Shared;
+                        var data = pool.Rent(len);
+                        try
+                        {
+                            Marshal.Copy(buf, data, 0, len);
+                            
+                            // Proxy sends via SOCKS5 to original destination
+                            if (_udpProxy.UdpSend(id, data, len, originalRemoteEndPoint, options, originalRemoteAddrPtr))
+                            {
+                                // Don't call nf_udpPostSend - proxy already sent it via SOCKS5
+                                return;
+                            }
+                        }
+                        finally
+                        {
+                            pool.Return(data);
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(originalRemoteAddrPtr);
+                    }
+                }
+                else if (isRedirectedToProxy && _udpProxy != null)
+                {
+                    // Already redirected - get original destination from stored map
+                    // Note: remoteAddrBytes is now the redirected address (local proxy), not original
+                    if (_udpOriginalDestinations.TryGetValue(id, out var storedOriginalAddr))
+                    {
+                        // Create IPEndPoint with stored original destination
+                        IPEndPoint? originalRemoteEndPoint = null;
+                        ushort storedAddrFamily = BitConverter.ToUInt16(storedOriginalAddr, 0);
+                        if (storedAddrFamily == AF_INET && storedOriginalAddr.Length >= 8)
+                        {
+                            ushort origPort = BitConverter.ToUInt16(storedOriginalAddr, 2);
+                            origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
+                            uint ipAddr = BitConverter.ToUInt32(storedOriginalAddr, 4);
+                            originalRemoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), origPort);
+                        }
+                        else if (storedAddrFamily == AF_INET6 && storedOriginalAddr.Length >= 24)
+                        {
+                            ushort origPort = BitConverter.ToUInt16(storedOriginalAddr, 2);
+                            origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
+                            byte[] ipAddrBytes = new byte[16];
+                            Array.Copy(storedOriginalAddr, 8, ipAddrBytes, 0, 16);
+                            originalRemoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), origPort);
+                        }
+                        
+                        if (originalRemoteEndPoint != null)
+                        {
+                            IntPtr originalRemoteAddrPtr = Marshal.AllocHGlobal(NF_MAX_ADDRESS_LENGTH);
+                            try
+                            {
+                                Marshal.Copy(storedOriginalAddr, 0, originalRemoteAddrPtr, NF_MAX_ADDRESS_LENGTH);
+                                
+                                var pool = ArrayPool<byte>.Shared;
+                                var data = pool.Rent(len);
+                                try
+                                {
+                                    Marshal.Copy(buf, data, 0, len);
+                                    
+                                    // Send through proxy with original destination
+                                    if (_udpProxy.UdpSend(id, data, len, originalRemoteEndPoint, options, originalRemoteAddrPtr))
+                                    {
+                                        // Don't call nf_udpPostSend - proxy already sent it via SOCKS5
+                                        return;
+                                    }
+                                }
+                                finally
+                                {
+                                    pool.Return(data);
+                                }
+                            }
+                            finally
+                            {
+                                Marshal.FreeHGlobal(originalRemoteAddrPtr);
+                            }
+                        }
+                    }
+                    
+                    // Fallback: post to NetFilter (proxy send failed or no stored original)
+                    NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
+                    return;
                 }
 
                 NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
