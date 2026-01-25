@@ -342,6 +342,29 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
+        /// Creates an IPEndPoint from address bytes (sockaddr format).
+        /// </summary>
+        private static IPEndPoint? CreateIPEndPointFromAddressBytes(byte[] addressBytes, ushort addrFamily)
+        {
+            if (addrFamily == AF_INET && addressBytes.Length >= 8)
+            {
+                ushort port = BitConverter.ToUInt16(addressBytes, 2);
+                port = (ushort)IPAddress.NetworkToHostOrder((short)port);
+                uint ipAddr = BitConverter.ToUInt32(addressBytes, 4);
+                return new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), port);
+            }
+            else if (addrFamily == AF_INET6 && addressBytes.Length >= 24)
+            {
+                ushort port = BitConverter.ToUInt16(addressBytes, 2);
+                port = (ushort)IPAddress.NetworkToHostOrder((short)port);
+                byte[] ipAddrBytes = new byte[16];
+                Array.Copy(addressBytes, 8, ipAddrBytes, 0, 16);
+                return new IPEndPoint(new IPAddress(ipAddrBytes), port);
+            }
+            return null;
+        }
+
+        /// <summary>
         /// UDP send callback. Handles DNS proxying and routes UDP packets through LocalUdpProxy.
         /// </summary>
         private static void StubUdpSend(ulong id, IntPtr remoteAddress, IntPtr buf, int len, IntPtr options)
@@ -511,23 +534,7 @@ namespace OmniPoss.Interop
                     }
                     
                     // Create IPEndPoint with ORIGINAL destination for proxy
-                    IPEndPoint? originalRemoteEndPoint = null;
-                    if (addrFamily == AF_INET && originalRemoteAddrBytes.Length >= 8)
-                    {
-                        ushort origPort = BitConverter.ToUInt16(originalRemoteAddrBytes, 2);
-                        origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
-                        uint ipAddr = BitConverter.ToUInt32(originalRemoteAddrBytes, 4);
-                        originalRemoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), origPort);
-                    }
-                    else if (addrFamily == AF_INET6 && originalRemoteAddrBytes.Length >= 24)
-                    {
-                        ushort origPort = BitConverter.ToUInt16(originalRemoteAddrBytes, 2);
-                        origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
-                        byte[] ipAddrBytes = new byte[16];
-                        Array.Copy(originalRemoteAddrBytes, 8, ipAddrBytes, 0, 16);
-                        originalRemoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), origPort);
-                    }
-                    
+                    var originalRemoteEndPoint = CreateIPEndPointFromAddressBytes(originalRemoteAddrBytes, addrFamily);
                     if (originalRemoteEndPoint == null)
                     {
                         NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
@@ -537,7 +544,7 @@ namespace OmniPoss.Interop
                     // Store original destination for this connection
                     _udpOriginalDestinations[id] = originalRemoteAddrBytes;
                     
-                    // Create IntPtr for original address (for proxy to store)
+                    // Create IntPtr for original address (for proxy to store - only needed on first call)
                     IntPtr originalRemoteAddrPtr = Marshal.AllocHGlobal(NF_MAX_ADDRESS_LENGTH);
                     try
                     {
@@ -577,52 +584,28 @@ namespace OmniPoss.Interop
                     if (_udpOriginalDestinations.TryGetValue(id, out var storedOriginalAddr))
                     {
                         // Create IPEndPoint with stored original destination
-                        IPEndPoint? originalRemoteEndPoint = null;
-                        ushort storedAddrFamily = BitConverter.ToUInt16(storedOriginalAddr, 0);
-                        if (storedAddrFamily == AF_INET && storedOriginalAddr.Length >= 8)
-                        {
-                            ushort origPort = BitConverter.ToUInt16(storedOriginalAddr, 2);
-                            origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
-                            uint ipAddr = BitConverter.ToUInt32(storedOriginalAddr, 4);
-                            originalRemoteEndPoint = new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), origPort);
-                        }
-                        else if (storedAddrFamily == AF_INET6 && storedOriginalAddr.Length >= 24)
-                        {
-                            ushort origPort = BitConverter.ToUInt16(storedOriginalAddr, 2);
-                            origPort = (ushort)IPAddress.NetworkToHostOrder((short)origPort);
-                            byte[] ipAddrBytes = new byte[16];
-                            Array.Copy(storedOriginalAddr, 8, ipAddrBytes, 0, 16);
-                            originalRemoteEndPoint = new IPEndPoint(new IPAddress(ipAddrBytes), origPort);
-                        }
+                        var originalRemoteEndPoint = CreateIPEndPointFromAddressBytes(storedOriginalAddr, BitConverter.ToUInt16(storedOriginalAddr, 0));
                         
                         if (originalRemoteEndPoint != null)
                         {
-                            IntPtr originalRemoteAddrPtr = Marshal.AllocHGlobal(NF_MAX_ADDRESS_LENGTH);
+                            var pool = ArrayPool<byte>.Shared;
+                            var data = pool.Rent(len);
                             try
                             {
-                                Marshal.Copy(storedOriginalAddr, 0, originalRemoteAddrPtr, NF_MAX_ADDRESS_LENGTH);
+                                Marshal.Copy(buf, data, 0, len);
                                 
-                                var pool = ArrayPool<byte>.Shared;
-                                var data = pool.Rent(len);
-                                try
+                                // Send through proxy with original destination
+                                // OPTIMIZATION: Pass IntPtr.Zero since StoreOriginalRemoteAddress only stores once
+                                // (checks _originalRemoteAddressBytes == null), so no need to allocate on every packet
+                                if (_udpProxy.UdpSend(id, data, len, originalRemoteEndPoint, options, IntPtr.Zero))
                                 {
-                                    Marshal.Copy(buf, data, 0, len);
-                                    
-                                    // Send through proxy with original destination
-                                    if (_udpProxy.UdpSend(id, data, len, originalRemoteEndPoint, options, originalRemoteAddrPtr))
-                                    {
-                                        // Don't call nf_udpPostSend - proxy already sent it via SOCKS5
-                                        return;
-                                    }
-                                }
-                                finally
-                                {
-                                    pool.Return(data);
+                                    // Don't call nf_udpPostSend - proxy already sent it via SOCKS5
+                                    return;
                                 }
                             }
                             finally
                             {
-                                Marshal.FreeHGlobal(originalRemoteAddrPtr);
+                                pool.Return(data);
                             }
                         }
                     }
