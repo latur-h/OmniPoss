@@ -137,9 +137,6 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                var processId = pConnInfo.processId;
-                var processIdCopy = processId;
-
                 try
                 {
                     if (NativeNetFilterApi.nf_tcpIsProxy(pConnInfo.processId))
@@ -155,27 +152,33 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                ushort originalPort = 0;
-                IPAddress? originalIp = null;
-                if (pConnInfo.ip_family == AF_INET)
+                // Fast private IP check - inline to avoid IPAddress object allocation
+                if (pConnInfo.ip_family == AF_INET && pConnInfo.remoteAddress.Length >= 8)
                 {
-                    originalPort = BitConverter.ToUInt16(pConnInfo.remoteAddress, 2);
-                    originalPort = (ushort)IPAddress.NetworkToHostOrder((short)originalPort);
-                    uint ipAddr = BitConverter.ToUInt32(pConnInfo.remoteAddress, 4);
-                    originalIp = new IPAddress(BitConverter.GetBytes(ipAddr));
+                    byte firstByte = pConnInfo.remoteAddress[4];
+                    if (firstByte == 10 || firstByte == 127 ||
+                        (firstByte == 172 && pConnInfo.remoteAddress[5] >= 16 && pConnInfo.remoteAddress[5] <= 31) ||
+                        (firstByte == 192 && pConnInfo.remoteAddress[5] == 168))
+                    {
+                        return;  // Private IP, bypass
+                    }
                 }
-                else if (pConnInfo.ip_family == AF_INET6)
+                else if (pConnInfo.ip_family == AF_INET6 && pConnInfo.remoteAddress.Length >= 24)
                 {
-                    originalPort = BitConverter.ToUInt16(pConnInfo.remoteAddress, 2);
-                    originalPort = (ushort)IPAddress.NetworkToHostOrder((short)originalPort);
-                    byte[] ipAddrBytes = new byte[16];
-                    Array.Copy(pConnInfo.remoteAddress, 8, ipAddrBytes, 0, 16);
-                    originalIp = new IPAddress(ipAddrBytes);
-                }
-
-                if (originalIp != null && IsPrivateAddress(originalIp))
-                {
-                    return;
+                    // Fast IPv6 loopback check
+                    bool isLoopback = true;
+                    for (int i = 8; i < 16; i++)
+                    {
+                        if (pConnInfo.remoteAddress[i] != 0)
+                        {
+                            isLoopback = false;
+                            break;
+                        }
+                    }
+                    if (isLoopback && pConnInfo.remoteAddress[23] == 1)
+                    {
+                        return;  // IPv6 loopback, bypass
+                    }
                 }
 
                 if (_tcpProxy != null && _tcpProxy.IsInitialized)
@@ -615,7 +618,6 @@ namespace OmniPoss.Interop
 
         private static readonly ConcurrentDictionary<uint, ProcessInfo> _processCache = new();
         private static readonly TimeSpan _processCacheTTL = TimeSpan.FromMinutes(5);
-        private static readonly object _processCacheLock = new();
         private static GCHandle _processCacheHandle;
 
         private struct PatternMatchResult
@@ -982,32 +984,6 @@ namespace OmniPoss.Interop
             return patternIndex == normalizedPattern.Length;
         }
 
-        /// <summary>
-        /// Extracts IP address from sockaddr structure for logging purposes.
-        /// </summary>
-        /// <param name="sockAddr">sockaddr structure bytes.</param>
-        /// <returns>IP address string or "Unknown" if extraction fails.</returns>
-        private static string ExtractIpFromSockAddr(byte[] sockAddr)
-        {
-            try
-            {
-                if (sockAddr == null || sockAddr.Length < 2) return "Unknown";
-                ushort family = BitConverter.ToUInt16(sockAddr, 0);
-                if (family == AF_INET && sockAddr.Length >= 8)
-                {
-                    uint ipAddr = BitConverter.ToUInt32(sockAddr, 4);
-                    return new IPAddress(BitConverter.GetBytes(ipAddr)).ToString();
-                }
-                else if (family == AF_INET6 && sockAddr.Length >= 24)
-                {
-                    byte[] ipAddrBytes = new byte[16];
-                    Array.Copy(sockAddr, 8, ipAddrBytes, 0, 16);
-                    return new IPAddress(ipAddrBytes).ToString();
-                }
-            }
-            catch { }
-            return "Unknown";
-        }
 
         private const int IPPROTO_TCP = 6;
         private const int IPPROTO_UDP = 17;
