@@ -81,7 +81,7 @@ namespace OmniPoss.Interop
         private static readonly object _cacheLock = new();
 
         // Track original UDP destinations for redirected connections
-        private static readonly ConcurrentDictionary<ulong, (byte[] Address, DateTime Timestamp)> _udpOriginalDestinations = new();
+        private static readonly ConcurrentDictionary<ulong, (byte[] Address, ushort AddressFamily, DateTime Timestamp)> _udpOriginalDestinations = new();
         private static DateTime _lastUdpCleanup = DateTime.UtcNow;
         private const int UdpCleanupIntervalMinutes = 5;
         private const int UdpMaxEntries = 10000;
@@ -168,8 +168,7 @@ namespace OmniPoss.Interop
         {
             var callbackStartTime = Stopwatch.GetTimestamp();
             var correlationId = $"{id}-{callbackStartTime}";
-            
-            // Track connection lifecycle
+
             var lifecycle = new ConnectionLifecycle
             {
                 ConnectionId = id,
@@ -177,12 +176,12 @@ namespace OmniPoss.Interop
                 ConnectRequestTimestamp = callbackStartTime
             };
             _connectionLifecycle[id] = lifecycle;
-            
+
             try
             {
                 QueueLog(() => Log.Debug("[TCP-CALLBACK] Entry: ConnId={ConnectionId} CorrId={CorrelationId} Time={Timestamp}",
                     id, correlationId, callbackStartTime));
-                
+
                 if (_filterParent && pConnInfo.processId == Environment.ProcessId)
                 {
                     QueueLog(() => Log.Debug("[TCP-CALLBACK] Bypass (filterParent): ConnId={ConnectionId}", id));
@@ -200,8 +199,6 @@ namespace OmniPoss.Interop
                 catch (EntryPointNotFoundException) { }
                 catch (DllNotFoundException) { }
 
-                // Fast private IP check - inline to avoid IPAddress object allocation
-                // Note: Process name filtering is handled by NetFilterSDK kernel rules, no need to check here
                 if (pConnInfo.ip_family == AF_INET && pConnInfo.remoteAddress.Length >= 8)
                 {
                     if (IsPrivateIPv4(pConnInfo.remoteAddress))
@@ -222,8 +219,7 @@ namespace OmniPoss.Interop
                 if (_tcpProxy != null && _tcpProxy.IsInitialized)
                 {
                     var localProxyPort = _tcpProxy.ListenPort;
-                    
-                    // Cache CreateSockAddr result (local proxy address doesn't change) - thread-safe
+
                     byte[] localProxyAddr;
                     lock (_cacheLock)
                     {
@@ -236,35 +232,29 @@ namespace OmniPoss.Interop
                         localProxyAddr = pConnInfo.ip_family == AF_INET6 ? _cachedLocalProxyAddrV6! : _cachedLocalProxyAddrV4!;
                     }
                     var isIPv6 = pConnInfo.ip_family == AF_INET6;
-                    
-                    // Extract port (needed for connection info storage)
+
                     ushort extractedPort = ExtractPort(pConnInfo.localAddress, pConnInfo.ip_family);
-                    
-                    // Save original addresses BEFORE modifying pConnInfo (copy directly to final arrays)
+
                     var originalRemoteAddr = new byte[NF_MAX_ADDRESS_LENGTH];
                     var originalLocalAddr = new byte[NF_MAX_ADDRESS_LENGTH];
                     Array.Copy(pConnInfo.remoteAddress, originalRemoteAddr, Math.Min(pConnInfo.remoteAddress.Length, NF_MAX_ADDRESS_LENGTH));
                     Array.Copy(pConnInfo.localAddress, originalLocalAddr, Math.Min(pConnInfo.localAddress.Length, NF_MAX_ADDRESS_LENGTH));
 
-                    // Modify pConnInfo for redirect
                     Array.Copy(localProxyAddr, pConnInfo.remoteAddress, Math.Min(localProxyAddr.Length, pConnInfo.remoteAddress.Length));
                     pConnInfo.ip_family = (ushort)(isIPv6 ? AF_INET6 : AF_INET);
                     pConnInfo.processId = (uint)Environment.ProcessId;
 
-                    // Create connInfoCopy with original addresses
                     var connInfoCopy = pConnInfo;
                     connInfoCopy.remoteAddress = originalRemoteAddr;
                     connInfoCopy.localAddress = originalLocalAddr;
-                    
-                    // Store connection info
+
                     _tcpProxy.SetConnInfo(connInfoCopy, id);
                     var callbackEndTime = Stopwatch.GetTimestamp();
                     var callbackDuration = (callbackEndTime - callbackStartTime) * 1000.0 / Stopwatch.Frequency;
-                    
-                    // Update lifecycle tracking
+
                     lifecycle.RedirectCompleteTimestamp = callbackEndTime;
                     lifecycle.LocalPort = extractedPort;
-                    
+
                     QueueLog(() => Log.Debug("[TCP-CALLBACK] Redirect: ConnId={ConnectionId} Port={Port} Duration={DurationMs:F2}ms RedirectTo=127.0.0.1:{LocalProxyPort}",
                         id, extractedPort, callbackDuration, localProxyPort));
                 }
@@ -277,7 +267,7 @@ namespace OmniPoss.Interop
             {
                 var callbackEndTime = Stopwatch.GetTimestamp();
                 var callbackDuration = (callbackEndTime - callbackStartTime) * 1000.0 / Stopwatch.Frequency;
-                QueueLog(() => Log.Error(ex, "[TCP] TcpConnectRequest ERROR for connection {ConnectionId}: {Message} (Duration: {DurationMs:F2}ms)", 
+                QueueLog(() => Log.Error(ex, "[TCP] TcpConnectRequest ERROR for connection {ConnectionId}: {Message} (Duration: {DurationMs:F2}ms)",
                     id, ex.Message, callbackDuration));
             }
         }
@@ -290,21 +280,19 @@ namespace OmniPoss.Interop
         private static void StubTcpConnected(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
             var connectedTimestamp = Stopwatch.GetTimestamp();
-            
+
             try
             {
                 if (_connectionLifecycle.TryGetValue(id, out var lifecycle))
                 {
                     lifecycle.ConnectedTimestamp = connectedTimestamp;
-                    
-                    // Calculate timing gaps
+
                     var redirectToConnected = (connectedTimestamp - lifecycle.RedirectCompleteTimestamp) * 1000.0 / Stopwatch.Frequency;
                     var totalFromRequest = (connectedTimestamp - lifecycle.ConnectRequestTimestamp) * 1000.0 / Stopwatch.Frequency;
-                    
+
                     QueueLog(() => Log.Debug("[TCP-CONNECTED] ConnId={ConnectionId} CorrId={CorrelationId} Redirect→Connected={RedirectToConnectedMs:F2}ms Total={TotalMs:F2}ms",
                         id, lifecycle.CorrelationId, redirectToConnected, totalFromRequest));
-                    
-                    // If accept has already completed, log the timing relationship
+
                     if (lifecycle.AcceptCompleteTimestamp.HasValue)
                     {
                         var connectedToAccept = (lifecycle.AcceptCompleteTimestamp.Value - connectedTimestamp) * 1000.0 / Stopwatch.Frequency;
@@ -330,7 +318,6 @@ namespace OmniPoss.Interop
         {
             try
             {
-                // Clean up lifecycle tracking immediately on close
                 if (_connectionLifecycle.TryRemove(id, out var lifecycle))
                 {
                     var totalLifetime = 0.0;
@@ -404,8 +391,6 @@ namespace OmniPoss.Interop
                 {
                     return;
                 }
-
-                // Note: Process name filtering is handled by NetFilterSDK kernel rules, no need to check here
             }
             catch (Exception ex)
             {
@@ -459,7 +444,6 @@ namespace OmniPoss.Interop
         /// </summary>
         private static bool IsRedirectedToProxy(byte[] addressBytes, ushort addrFamily, ushort port)
         {
-            // Proxy state should be checked by caller to avoid repeated null checks
             if (_tcpProxy == null || !_tcpProxy.IsInitialized)
                 return false;
 
@@ -548,7 +532,7 @@ namespace OmniPoss.Interop
             if (originalRemoteEndPoint == null)
                 return false;
 
-            _udpOriginalDestinations[id] = (originalRemoteAddrBytes, DateTime.UtcNow);
+            _udpOriginalDestinations[id] = (originalRemoteAddrBytes, addrFamily, DateTime.UtcNow);
 
             IntPtr originalRemoteAddrPtr = Marshal.AllocHGlobal(NF_MAX_ADDRESS_LENGTH);
             try
@@ -590,16 +574,15 @@ namespace OmniPoss.Interop
 
             try
             {
-                // Use WSA API for address conversion (more robust)
                 int addressFamily = addrFamily == AF_INET6 ? NativeMethods.AF_INET6 : NativeMethods.AF_INET;
                 int addrLen = Math.Min(addressBytes.Length, NF_MAX_ADDRESS_LENGTH);
-                
+
                 unsafe
                 {
                     fixed (byte* addrPtr = addressBytes)
                     {
                         IntPtr sockaddrPtr = new IntPtr(addrPtr);
-                        var sb = new System.Text.StringBuilder(64); // Enough for IPv6 with port
+                        var sb = new System.Text.StringBuilder(64);
                         int sbLen = sb.Capacity;
 
                         int result = NativeMethods.WSAAddressToStringA(
@@ -611,22 +594,19 @@ namespace OmniPoss.Interop
 
                         if (result == 0)
                         {
-                            // Parse the address string (format: "ip:port" or "[ipv6]:port")
                             string addressString = sb.ToString();
-                            // Try parsing as IPEndPoint format
                             int colonIndex = addressString.LastIndexOf(':');
                             if (colonIndex > 0)
                             {
                                 string ipPart = addressString.Substring(0, colonIndex);
                                 string portPart = addressString.Substring(colonIndex + 1);
-                                
-                                // Remove brackets from IPv6
+
                                 if (ipPart.StartsWith("[") && ipPart.EndsWith("]"))
                                 {
                                     ipPart = ipPart.Substring(1, ipPart.Length - 2);
                                 }
-                                
-                                if (IPAddress.TryParse(ipPart, out IPAddress? ip) && 
+
+                                if (IPAddress.TryParse(ipPart, out IPAddress? ip) &&
                                     int.TryParse(portPart, out int port))
                                 {
                                     return new IPEndPoint(ip, port);
@@ -635,7 +615,6 @@ namespace OmniPoss.Interop
                         }
                         else
                         {
-                            // WSA conversion failed, fall back to manual parsing
                             int error = NativeMethods.WSAGetLastError();
                             QueueLog(() => Log.Debug("[WSA] WSAAddressToString failed: {Error}, falling back to manual parsing", error));
                         }
@@ -647,38 +626,35 @@ namespace OmniPoss.Interop
                 QueueLog(() => Log.Debug("[WSA] Exception in CreateIPEndPointFromAddressBytes WSA path: {Error}, falling back to manual parsing", ex.Message));
             }
 
-            // Fallback: Manual parsing (original implementation)
             if (addrFamily == AF_INET)
             {
                 if (addressBytes.Length < 8)
                     return null;
-                
+
                 ushort port = BitConverter.ToUInt16(addressBytes, 2);
                 port = (ushort)IPAddress.NetworkToHostOrder((short)port);
                 uint ipAddr = BitConverter.ToUInt32(addressBytes, 4);
                 var ip = new IPAddress(BitConverter.GetBytes(ipAddr));
-                
-                // Validate address family matches
+
                 if (ip.AddressFamily != AddressFamily.InterNetwork)
                     return null;
-                
+
                 return new IPEndPoint(ip, port);
             }
             else if (addrFamily == AF_INET6)
             {
                 if (addressBytes.Length < 24)
                     return null;
-                
+
                 ushort port = BitConverter.ToUInt16(addressBytes, 2);
                 port = (ushort)IPAddress.NetworkToHostOrder((short)port);
                 byte[] ipAddrBytes = new byte[16];
                 Array.Copy(addressBytes, 8, ipAddrBytes, 0, 16);
                 var ip = new IPAddress(ipAddrBytes);
-                
-                // Validate address family matches
+
                 if (ip.AddressFamily != AddressFamily.InterNetworkV6)
                     return null;
-                
+
                 return new IPEndPoint(ip, port);
             }
             return null;
@@ -698,7 +674,6 @@ namespace OmniPoss.Interop
                 ushort remotePort = 0;
                 bool isValidAddress = false;
 
-                // Cache proxy state to avoid repeated null checks
                 bool tcpProxyReady = _tcpProxy != null && _tcpProxy.IsInitialized;
                 bool udpProxyReady = _udpProxy != null;
 
@@ -713,7 +688,6 @@ namespace OmniPoss.Interop
                     isValidAddress = true;
                 }
 
-                // Fast private IP check (inline, no IPAddress allocation)
                 if (isValidAddress)
                 {
                     bool isPrivate = false;
@@ -728,7 +702,6 @@ namespace OmniPoss.Interop
 
                     if (isPrivate)
                     {
-                        // Private IP, bypass (unless DNS or redirected to proxy)
                         if (remotePort != 53 || !_filterDNS)
                         {
                             NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
@@ -737,7 +710,6 @@ namespace OmniPoss.Interop
                     }
                 }
 
-                // DNS handling
                 if (isValidAddress && HandleDnsProxy(id, remoteAddrBytes, addrFamily, remotePort, buf, len, options, remoteAddress))
                 {
                     return;
@@ -749,10 +721,8 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Check if redirected to proxy (using cached proxy state)
                 bool isRedirectedToProxy = tcpProxyReady && udpProxyReady && IsRedirectedToProxy(remoteAddrBytes, addrFamily, remotePort);
 
-                // Redirect UDP connection to local proxy (if not already redirected)
                 if (!isRedirectedToProxy)
                 {
                     if (RedirectUdpToProxy(id, remoteAddrBytes, addrFamily, remotePort, buf, len, options, remoteAddress))
@@ -762,13 +732,10 @@ namespace OmniPoss.Interop
                 }
                 else if (udpProxyReady && _udpProxy != null)
                 {
-                    // Already redirected - get original destination from stored map
-                    // Note: remoteAddrBytes is now the redirected address (local proxy), not original
                     if (_udpOriginalDestinations.TryGetValue(id, out var storedEntry))
                     {
-                        // Create IPEndPoint with stored original destination
-                        var originalRemoteEndPoint = CreateIPEndPointFromAddressBytes(storedEntry.Address, BitConverter.ToUInt16(storedEntry.Address, 0));
-                        
+                        var originalRemoteEndPoint = CreateIPEndPointFromAddressBytes(storedEntry.Address, storedEntry.AddressFamily);
+
                         if (originalRemoteEndPoint != null)
                         {
                             var pool = ArrayPool<byte>.Shared;
@@ -776,13 +743,9 @@ namespace OmniPoss.Interop
                             try
                             {
                                 Marshal.Copy(buf, data, 0, len);
-                                
-                                // Send through proxy with original destination
-                                // OPTIMIZATION: Pass IntPtr.Zero since StoreOriginalRemoteAddress only stores once
-                                // (checks _originalRemoteAddressBytes == null), so no need to allocate on every packet
+
                                 if (_udpProxy.UdpSend(id, data, len, originalRemoteEndPoint, options, IntPtr.Zero))
                                 {
-                                    // Don't call nf_udpPostSend - proxy already sent it via SOCKS5
                                     return;
                                 }
                             }
@@ -792,8 +755,7 @@ namespace OmniPoss.Interop
                             }
                         }
                     }
-                    
-                    // Fallback: post to NetFilter (proxy send failed or no stored original)
+
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                     return;
                 }
@@ -834,11 +796,13 @@ namespace OmniPoss.Interop
             if (ipHeader.Length < 10 || ipHeader[9] != IPPROTO_ICMP || _icmpDelay <= 0)
                 return false;
 
-            // Include ICMP type and code in key for more accurate tracking
-            // ICMP type is at offset 0 of ICMP header (offset 20 from IP header start)
-            // ICMP code is at offset 1 of ICMP header
-            byte icmpType = ipHeader.Length >= 21 ? ipHeader[20] : (byte)0;
-            byte icmpCode = ipHeader.Length >= 22 ? ipHeader[21] : (byte)0;
+            byte icmpType = (byte)0;
+            byte icmpCode = (byte)0;
+            if (ipHeader.Length >= ICMP_CODE_OFFSET + 1)
+            {
+                icmpType = ipHeader[ICMP_TYPE_OFFSET];
+                icmpCode = ipHeader[ICMP_CODE_OFFSET];
+            }
             string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}-{icmpType}-{icmpCode}";
 
             lock (_icmpDelayLock)
@@ -848,12 +812,12 @@ namespace OmniPoss.Interop
                     var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
                     if (elapsed < _icmpDelay)
                     {
-                        return true; // Delay this packet
+                        return true;
                     }
                 }
                 _icmpPacketTimes[packetKey] = DateTime.UtcNow;
             }
-            return false; // Process this packet
+            return false;
         }
 
         /// <summary>
@@ -866,10 +830,10 @@ namespace OmniPoss.Interop
         {
             try
             {
-                if (!_filterICMP || len < 20)
+                if (!_filterICMP || len < IP_HEADER_MIN_LENGTH)
                     return;
 
-                byte[] ipHeader = new byte[Math.Min(20, len)];
+                byte[] ipHeader = new byte[Math.Min(IP_HEADER_MIN_LENGTH, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
                 if (ShouldDelayIcmpPacket(ipHeader))
@@ -893,10 +857,10 @@ namespace OmniPoss.Interop
         {
             try
             {
-                if (!_filterICMP || len < 20)
+                if (!_filterICMP || len < IP_HEADER_MIN_LENGTH)
                     return;
 
-                byte[] ipHeader = new byte[Math.Min(20, len)];
+                byte[] ipHeader = new byte[Math.Min(IP_HEADER_MIN_LENGTH, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
                 if (ShouldDelayIcmpPacket(ipHeader))
@@ -917,15 +881,15 @@ namespace OmniPoss.Interop
         private static Task? _logProcessorTask = null;
         private static readonly object _logProcessorLock = new();
 
-        // Note: Process name filtering is handled by NetFilterSDK kernel rules (NF_RULE_EX.processName)
-        // No need for callback-level process name lookups - kernel already filters based on rules
-
-
         private const int IPPROTO_TCP = 6;
         private const int IPPROTO_UDP = 17;
         private const int IPPROTO_ICMP = 1;
         private const int NF_MAX_IP_ADDRESS_LENGTH = 16;
         private const int NF_MAX_ADDRESS_LENGTH = 28;
+        private const int IP_HEADER_MIN_LENGTH = 20;
+        private const int ICMP_HEADER_OFFSET = 20;
+        private const int ICMP_TYPE_OFFSET = 20;
+        private const int ICMP_CODE_OFFSET = 21;
 
         /// <summary>
         /// Extracts port from address bytes (sockaddr format).
@@ -935,8 +899,7 @@ namespace OmniPoss.Interop
         {
             if (addressBytes == null || addressBytes.Length < 4)
                 return 0;
-            
-            // Port is at offset 2 for both IPv4 and IPv6
+
             ushort port = BitConverter.ToUInt16(addressBytes, 2);
             return (ushort)IPAddress.NetworkToHostOrder((short)port);
         }
@@ -1266,7 +1229,7 @@ namespace OmniPoss.Interop
                     var eventHandlerSize = Marshal.SizeOf(typeof(NativeNetFilterApi.NF_EventHandler));
                     _eventHandlerPtr = Marshal.AllocHGlobal(eventHandlerSize);
                     Marshal.StructureToPtr(eventHandler, _eventHandlerPtr, true);
-                    
+
                     // CRITICAL FIX: Initialize proxy servers BEFORE nf_init() to match C redirector behavior
                     // This ensures accept loop is running and ready when NetFilter callbacks activate
                     // Reference: Accept_Investigation.md - Solution 1: Fix Initialization Order
@@ -1298,7 +1261,7 @@ namespace OmniPoss.Interop
                     {
                         Log.Warning("SOCKS5 target not configured - local proxy servers not initialized");
                     }
-                    
+
                     if (Application.MessageLoop && Application.OpenForms.Count > 0)
                     {
                         NF_STATUS result = NF_STATUS.NF_STATUS_FAIL;
@@ -1872,7 +1835,7 @@ namespace OmniPoss.Interop
         {
             var now = DateTime.UtcNow;
             var shouldCleanup = (now - _lastUdpCleanup).TotalMinutes >= UdpCleanupIntervalMinutes || _udpOriginalDestinations.Count > UdpMaxEntries;
-            
+
             if (!shouldCleanup)
                 return;
 
@@ -1880,7 +1843,6 @@ namespace OmniPoss.Interop
             var cutoffTime = now - TimeSpan.FromMinutes(UdpEntryMaxAgeMinutes);
             var keysToRemove = new HashSet<ulong>();
 
-            // Time-based cleanup: remove entries older than cutoff time
             foreach (var kvp in _udpOriginalDestinations)
             {
                 if (kvp.Value.Timestamp < cutoffTime)
@@ -1889,13 +1851,11 @@ namespace OmniPoss.Interop
                 }
             }
 
-            // Count-based cleanup: if still over target, remove oldest entries
             if (_udpOriginalDestinations.Count - keysToRemove.Count > UdpCleanupTargetEntries)
             {
                 var remainingToRemove = (_udpOriginalDestinations.Count - keysToRemove.Count) - UdpCleanupTargetEntries;
                 var sortedList = new List<(ulong Key, DateTime Timestamp)>();
-                
-                // Collect entries not already marked for removal (O(1) lookup with HashSet)
+
                 foreach (var kvp in _udpOriginalDestinations)
                 {
                     if (!keysToRemove.Contains(kvp.Key))
@@ -1903,11 +1863,9 @@ namespace OmniPoss.Interop
                         sortedList.Add((kvp.Key, kvp.Value.Timestamp));
                     }
                 }
-                
-                // Sort by timestamp (oldest first)
+
                 sortedList.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
-                
-                // Add oldest entries to removal list
+
                 for (int i = 0; i < remainingToRemove && i < sortedList.Count; i++)
                 {
                     keysToRemove.Add(sortedList[i].Key);
@@ -1921,7 +1879,7 @@ namespace OmniPoss.Interop
 
             if (keysToRemove.Count > 0)
             {
-                QueueLog(() => Log.Debug("[UDP] Cleaned up {Count} old UDP original destination entries (remaining: {Remaining})", 
+                QueueLog(() => Log.Debug("[UDP] Cleaned up {Count} old UDP original destination entries (remaining: {Remaining})",
                     keysToRemove.Count, _udpOriginalDestinations.Count));
             }
         }
@@ -1943,7 +1901,7 @@ namespace OmniPoss.Interop
                     return;
 
                 var cutoffTime = Stopwatch.GetTimestamp() - (long)(TimeSpan.FromMinutes(LifecycleEntryMaxAgeMinutes).TotalSeconds * Stopwatch.Frequency);
-                var keysToRemove = new List<ulong>();
+                var keysToRemove = new HashSet<ulong>();
 
                 foreach (var kvp in _connectionLifecycle)
                 {
@@ -2171,12 +2129,10 @@ namespace OmniPoss.Interop
             {
                 lifecycle.AcceptStartTimestamp = acceptStartTime;
                 lifecycle.AcceptCompleteTimestamp = acceptEndTime;
-                
-                // Calculate timing gaps
+
                 var redirectToAcceptStart = (acceptStartTime - lifecycle.RedirectCompleteTimestamp) * 1000.0 / Stopwatch.Frequency;
                 var acceptWait = (acceptEndTime - acceptStartTime) * 1000.0 / Stopwatch.Frequency;
-                
-                // If Connected callback has fired, calculate that gap too
+
                 if (lifecycle.ConnectedTimestamp.HasValue)
                 {
                     var connectedToAcceptStart = (acceptStartTime - lifecycle.ConnectedTimestamp.Value) * 1000.0 / Stopwatch.Frequency;

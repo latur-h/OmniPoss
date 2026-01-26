@@ -406,8 +406,12 @@ namespace OmniPoss.Core
                 // Step 8: Update Socks5ClientService properties
                 await ApplySocks5ClientServiceChangesAsync(newConfig.Socks5ServerConfig);
 
-                // Step 9: Update tray menu
+                // Step 9: Update tray menu (initial state - will be updated as async operations complete)
                 UpdateTrayMenu(newConfig);
+
+                // Step 10: Update NetFilter and Proxy status immediately (they're synchronous or already updated)
+                _trayMenu.ToggleNetFilter(_mainController.IsRunning);
+                _trayMenu.ToggleProxy(_proxyService.IsEnabled);
 
                 _logger.LogInformation("Hot-reload completed successfully");
             }
@@ -532,14 +536,20 @@ namespace OmniPoss.Core
                     {
                         await _coreManager.LaunchAsync(core);
                         _logger.LogInformation("[{CoreKey}] Core relaunched successfully", runningKey);
+                        // Update menu status after relaunch completes
+                        _trayMenu.ToggleCore(runningKey, _coreManager.IsRunning(runningKey));
                     }
                     catch (OperationCanceledException)
                     {
                         _logger.LogInformation("[{CoreKey}] Core relaunch cancelled", runningKey);
+                        // Update menu status even if cancelled
+                        _trayMenu.ToggleCore(runningKey, _coreManager.IsRunning(runningKey));
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(ex, "[{CoreKey}] Failed to relaunch core", runningKey);
+                        // Update menu status even if failed
+                        _trayMenu.ToggleCore(runningKey, _coreManager.IsRunning(runningKey));
                     }
                 }, cancellationToken);
                 _backgroundTasks.Add(task);
@@ -658,6 +668,8 @@ namespace OmniPoss.Core
                         // Use _config.ProxyConfig to ensure we're using the updated in-memory config
                         _proxyService.Enable(_config.ProxyConfig);
                         _logger.LogInformation("ProxyService reloaded successfully with {Host}:{Port}", currentProxy.Hostname, currentProxy.Port);
+                        // Update menu status after reload
+                        _trayMenu.ToggleProxy(_proxyService.IsEnabled);
                     }
                     catch (Exception ex)
                     {
