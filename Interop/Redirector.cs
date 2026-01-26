@@ -11,6 +11,7 @@ using Serilog;
 using System.Globalization;
 using System.Threading;
 using System.Buffers;
+using static OmniPoss.Infrastructure.Interop.NativeMethods;
 
 namespace OmniPoss.Interop
 {
@@ -48,6 +49,24 @@ namespace OmniPoss.Interop
 
         private static LocalTcpProxy? _tcpProxy;
         private static LocalUdpProxy? _udpProxy;
+
+        /// <summary>
+        /// Connection lifecycle tracking for timing analysis.
+        /// Tracks key events: ConnectRequest (redirect), Connected (NetFilter established), Accept (listener accepted).
+        /// </summary>
+        private class ConnectionLifecycle
+        {
+            public ulong ConnectionId { get; set; }
+            public string CorrelationId { get; set; } = string.Empty;
+            public long ConnectRequestTimestamp { get; set; }  // When redirect happens
+            public long RedirectCompleteTimestamp { get; set; }  // When redirect completes
+            public long? ConnectedTimestamp { get; set; }  // When NetFilterSDK considers connection established
+            public long? AcceptStartTimestamp { get; set; }  // When accept() starts waiting
+            public long? AcceptCompleteTimestamp { get; set; }  // When accept() returns
+            public ushort LocalPort { get; set; }
+        }
+
+        private static readonly ConcurrentDictionary<ulong, ConnectionLifecycle> _connectionLifecycle = new();
         private static ushort _localProxyPort = 8888;
 
         // Cached local proxy addresses (avoid CreateSockAddr allocation per connection)
@@ -133,10 +152,26 @@ namespace OmniPoss.Interop
         /// </summary>
         private static void StubTcpConnectRequest(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
+            var callbackStartTime = Stopwatch.GetTimestamp();
+            var correlationId = $"{id}-{callbackStartTime}";
+            
+            // Track connection lifecycle
+            var lifecycle = new ConnectionLifecycle
+            {
+                ConnectionId = id,
+                CorrelationId = correlationId,
+                ConnectRequestTimestamp = callbackStartTime
+            };
+            _connectionLifecycle[id] = lifecycle;
+            
             try
             {
+                Log.Debug("[TCP-CALLBACK] Entry: ConnId={ConnectionId} CorrId={CorrelationId} Time={Timestamp}",
+                    id, correlationId, callbackStartTime);
+                
                 if (_filterParent && pConnInfo.processId == Environment.ProcessId)
                 {
+                    Log.Debug("[TCP-CALLBACK] Bypass (filterParent): ConnId={ConnectionId}", id);
                     return;
                 }
 
@@ -144,6 +179,7 @@ namespace OmniPoss.Interop
                 {
                     if (NativeNetFilterApi.nf_tcpIsProxy(pConnInfo.processId))
                     {
+                        Log.Debug("[TCP-CALLBACK] Bypass (isProxy): ConnId={ConnectionId}", id);
                         return;
                     }
                 }
@@ -159,6 +195,7 @@ namespace OmniPoss.Interop
                         (firstByte == 172 && pConnInfo.remoteAddress[5] >= 16 && pConnInfo.remoteAddress[5] <= 31) ||
                         (firstByte == 192 && pConnInfo.remoteAddress[5] == 168))
                     {
+                        Log.Debug("[TCP-CALLBACK] Bypass (private IP): ConnId={ConnectionId}", id);
                         return;  // Private IP, bypass
                     }
                 }
@@ -176,6 +213,7 @@ namespace OmniPoss.Interop
                     }
                     if (isLoopback && pConnInfo.remoteAddress[23] == 1)
                     {
+                        Log.Debug("[TCP-CALLBACK] Bypass (IPv6 loopback): ConnId={ConnectionId}", id);
                         return;  // IPv6 loopback, bypass
                     }
                 }
@@ -195,6 +233,21 @@ namespace OmniPoss.Interop
                     var localProxyAddr = pConnInfo.ip_family == AF_INET6 ? _cachedLocalProxyAddrV6! : _cachedLocalProxyAddrV4!;
                     var isIPv6 = pConnInfo.ip_family == AF_INET6;
                     
+                    // Extract port (needed for connection info storage)
+                    ushort extractedPort = 0;
+                    var localAddr = pConnInfo.localAddress;
+                    if (localAddr != null && localAddr.Length >= 4)
+                    {
+                        if (pConnInfo.ip_family == 2) // AF_INET
+                        {
+                            extractedPort = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(localAddr, 2));
+                        }
+                        else if (pConnInfo.ip_family == 23) // AF_INET6
+                        {
+                            extractedPort = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(localAddr, 2));
+                        }
+                    }
+                    
                     // Save original addresses BEFORE modifying pConnInfo (copy directly to final arrays)
                     var originalRemoteAddr = new byte[NF_MAX_ADDRESS_LENGTH];
                     var originalLocalAddr = new byte[NF_MAX_ADDRESS_LENGTH];
@@ -210,7 +263,19 @@ namespace OmniPoss.Interop
                     var connInfoCopy = pConnInfo;
                     connInfoCopy.remoteAddress = originalRemoteAddr;
                     connInfoCopy.localAddress = originalLocalAddr;
-                    _tcpProxy.SetConnInfo(connInfoCopy);
+                    
+                    // Store connection info and log timing (focus on problematic spot)
+                    var setConnInfoTime = Stopwatch.GetTimestamp();
+                    _tcpProxy.SetConnInfo(connInfoCopy, id);
+                    var callbackEndTime = Stopwatch.GetTimestamp();
+                    var callbackDuration = (callbackEndTime - callbackStartTime) * 1000.0 / Stopwatch.Frequency;
+                    
+                    // Update lifecycle tracking
+                    lifecycle.RedirectCompleteTimestamp = callbackEndTime;
+                    lifecycle.LocalPort = extractedPort;
+                    
+                    Log.Debug("[TCP-CALLBACK] Redirect: ConnId={ConnectionId} Port={Port} Duration={DurationMs:F2}ms RedirectTo=127.0.0.1:{LocalProxyPort}",
+                        id, extractedPort, callbackDuration, localProxyPort);
                 }
                 else
                 {
@@ -219,15 +284,52 @@ namespace OmniPoss.Interop
             }
             catch (Exception ex)
             {
-                QueueLog(() => Log.Error(ex, "[TCP] TcpConnectRequest ERROR for connection {ConnectionId}: {Message}", id, ex.Message));
+                var callbackEndTime = Stopwatch.GetTimestamp();
+                var callbackDuration = (callbackEndTime - callbackStartTime) * 1000.0 / Stopwatch.Frequency;
+                QueueLog(() => Log.Error(ex, "[TCP] TcpConnectRequest ERROR for connection {ConnectionId}: {Message} (Duration: {DurationMs:F2}ms)", 
+                    id, ex.Message, callbackDuration));
             }
         }
 
         /// <summary>
         /// TCP connection established callback.
+        /// Called by NetFilterSDK when the TCP connection is fully established (after SYN-ACK handshake).
+        /// This is a critical timing point - it tells us when NetFilterSDK considers the connection ready.
         /// </summary>
         private static void StubTcpConnected(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
+            var connectedTimestamp = Stopwatch.GetTimestamp();
+            
+            try
+            {
+                if (_connectionLifecycle.TryGetValue(id, out var lifecycle))
+                {
+                    lifecycle.ConnectedTimestamp = connectedTimestamp;
+                    
+                    // Calculate timing gaps
+                    var redirectToConnected = (connectedTimestamp - lifecycle.RedirectCompleteTimestamp) * 1000.0 / Stopwatch.Frequency;
+                    var totalFromRequest = (connectedTimestamp - lifecycle.ConnectRequestTimestamp) * 1000.0 / Stopwatch.Frequency;
+                    
+                    Log.Debug("[TCP-CONNECTED] ConnId={ConnectionId} CorrId={CorrelationId} Redirect→Connected={RedirectToConnectedMs:F2}ms Total={TotalMs:F2}ms",
+                        id, lifecycle.CorrelationId, redirectToConnected, totalFromRequest);
+                    
+                    // If accept has already completed, log the timing relationship
+                    if (lifecycle.AcceptCompleteTimestamp.HasValue)
+                    {
+                        var connectedToAccept = (lifecycle.AcceptCompleteTimestamp.Value - connectedTimestamp) * 1000.0 / Stopwatch.Frequency;
+                        Log.Debug("[TCP-CONNECTED] ConnId={ConnectionId} Connected→Accept={ConnectedToAcceptMs:F2}ms (Accept happened {When})",
+                            id, connectedToAccept, connectedToAccept < 0 ? "BEFORE Connected" : "AFTER Connected");
+                    }
+                }
+                else
+                {
+                    Log.Debug("[TCP-CONNECTED] ConnId={ConnectionId} (no lifecycle tracking)", id);
+                }
+            }
+            catch (Exception ex)
+            {
+                QueueLog(() => Log.Error(ex, "[TCP] TcpConnected ERROR for connection {ConnectionId}", id));
+            }
         }
 
         /// <summary>
@@ -235,6 +337,25 @@ namespace OmniPoss.Interop
         /// </summary>
         private static void StubTcpClosed(ulong id, ref NativeNetFilterApi.NF_TCP_CONN_INFO pConnInfo)
         {
+            try
+            {
+                // Clean up lifecycle tracking
+                if (_connectionLifecycle.TryRemove(id, out var lifecycle))
+                {
+                    var totalLifetime = 0.0;
+                    if (lifecycle.AcceptCompleteTimestamp.HasValue)
+                    {
+                        var closeTimestamp = Stopwatch.GetTimestamp();
+                        totalLifetime = (closeTimestamp - lifecycle.ConnectRequestTimestamp) * 1000.0 / Stopwatch.Frequency;
+                    }
+                    Log.Debug("[TCP-CLOSED] ConnId={ConnectionId} CorrId={CorrelationId} Lifetime={LifetimeMs:F2}ms",
+                        id, lifecycle.CorrelationId, totalLifetime);
+                }
+            }
+            catch (Exception ex)
+            {
+                QueueLog(() => Log.Error(ex, "[TCP] TcpClosed ERROR for connection {ConnectionId}", id));
+            }
         }
 
         /// <summary>
@@ -342,10 +463,74 @@ namespace OmniPoss.Interop
         }
 
         /// <summary>
-        /// Creates an IPEndPoint from address bytes (sockaddr format).
+        /// Creates an IPEndPoint from address bytes (sockaddr format) using WSA APIs for optimal performance.
+        /// Uses WSAAddressToString for robust address parsing.
         /// </summary>
         private static IPEndPoint? CreateIPEndPointFromAddressBytes(byte[] addressBytes, ushort addrFamily)
         {
+            if (addressBytes == null || addressBytes.Length < 8)
+                return null;
+
+            try
+            {
+                // Use WSA API for address conversion (more robust)
+                int addressFamily = addrFamily == AF_INET6 ? NativeMethods.AF_INET6 : NativeMethods.AF_INET;
+                int addrLen = Math.Min(addressBytes.Length, NF_MAX_ADDRESS_LENGTH);
+                
+                unsafe
+                {
+                    fixed (byte* addrPtr = addressBytes)
+                    {
+                        IntPtr sockaddrPtr = new IntPtr(addrPtr);
+                        var sb = new System.Text.StringBuilder(64); // Enough for IPv6 with port
+                        int sbLen = sb.Capacity;
+
+                        int result = NativeMethods.WSAAddressToStringA(
+                            sockaddrPtr,
+                            addrLen,
+                            IntPtr.Zero,
+                            sb,
+                            ref sbLen);
+
+                        if (result == 0)
+                        {
+                            // Parse the address string (format: "ip:port" or "[ipv6]:port")
+                            string addressString = sb.ToString();
+                            // Try parsing as IPEndPoint format
+                            int colonIndex = addressString.LastIndexOf(':');
+                            if (colonIndex > 0)
+                            {
+                                string ipPart = addressString.Substring(0, colonIndex);
+                                string portPart = addressString.Substring(colonIndex + 1);
+                                
+                                // Remove brackets from IPv6
+                                if (ipPart.StartsWith("[") && ipPart.EndsWith("]"))
+                                {
+                                    ipPart = ipPart.Substring(1, ipPart.Length - 2);
+                                }
+                                
+                                if (IPAddress.TryParse(ipPart, out IPAddress? ip) && 
+                                    int.TryParse(portPart, out int port))
+                                {
+                                    return new IPEndPoint(ip, port);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // WSA conversion failed, fall back to manual parsing
+                            int error = NativeMethods.WSAGetLastError();
+                            System.Diagnostics.Debug.WriteLine($"[WSA] WSAAddressToString failed: {error}, falling back to manual parsing");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to manual parsing
+            }
+
+            // Fallback: Manual parsing (original implementation)
             if (addrFamily == AF_INET && addressBytes.Length >= 8)
             {
                 ushort port = BitConverter.ToUInt16(addressBytes, 2);
@@ -1079,6 +1264,39 @@ namespace OmniPoss.Interop
                     var eventHandlerSize = Marshal.SizeOf(typeof(NativeNetFilterApi.NF_EventHandler));
                     _eventHandlerPtr = Marshal.AllocHGlobal(eventHandlerSize);
                     Marshal.StructureToPtr(eventHandler, _eventHandlerPtr, true);
+                    
+                    // CRITICAL FIX: Initialize proxy servers BEFORE nf_init() to match C redirector behavior
+                    // This ensures accept loop is running and ready when NetFilter callbacks activate
+                    // Reference: Accept_Investigation.md - Solution 1: Fix Initialization Order
+                    if (!string.IsNullOrEmpty(_targetHost) && _targetPort > 0)
+                    {
+                        try
+                        {
+                            var socks5Target = new IPEndPoint(IPAddress.Parse(_targetHost), _targetPort);
+
+                            _tcpProxy = new LocalTcpProxy();
+                            if (!_tcpProxy.Initialize(_localProxyPort, socks5Target, _targetUser, _targetPass))
+                            {
+                                throw new Exception("Failed to initialize local TCP proxy");
+                            }
+                            _localProxyPort = _tcpProxy.ListenPort;
+
+                            _udpProxy = new LocalUdpProxy(socks5Target, _targetUser, _targetPass);
+
+                            Log.Information("Local proxy servers initialized BEFORE nf_init(): TCP on port {TcpPort}, SOCKS5 target: {Socks5Target}",
+                                _localProxyPort, socks5Target);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error(ex, "Failed to initialize local proxy servers");
+                            throw new Exception($"Failed to initialize local proxy servers: {ex.Message}", ex);
+                        }
+                    }
+                    else
+                    {
+                        Log.Warning("SOCKS5 target not configured - local proxy servers not initialized");
+                    }
+                    
                     if (Application.MessageLoop && Application.OpenForms.Count > 0)
                     {
                         NF_STATUS result = NF_STATUS.NF_STATUS_FAIL;
@@ -1154,35 +1372,6 @@ namespace OmniPoss.Interop
                         {
                         }
                         throw new Exception(errorMsg);
-                    }
-
-                    if (!string.IsNullOrEmpty(_targetHost) && _targetPort > 0)
-                    {
-                        try
-                        {
-                            var socks5Target = new IPEndPoint(IPAddress.Parse(_targetHost), _targetPort);
-
-                            _tcpProxy = new LocalTcpProxy();
-                            if (!_tcpProxy.Initialize(_localProxyPort, socks5Target, _targetUser, _targetPass))
-                            {
-                                throw new Exception("Failed to initialize local TCP proxy");
-                            }
-                            _localProxyPort = _tcpProxy.ListenPort;
-
-                            _udpProxy = new LocalUdpProxy(socks5Target, _targetUser, _targetPass);
-
-                            Log.Information("Local proxy servers initialized: TCP on port {TcpPort}, SOCKS5 target: {Socks5Target}",
-                                _localProxyPort, socks5Target);
-                        }
-                        catch (Exception ex)
-                        {
-                            Log.Error(ex, "Failed to initialize local proxy servers");
-                            throw new Exception($"Failed to initialize local proxy servers: {ex.Message}", ex);
-                        }
-                    }
-                    else
-                    {
-                        Log.Warning("SOCKS5 target not configured - local proxy servers not initialized");
                     }
 
                     try
@@ -1814,6 +2003,36 @@ namespace OmniPoss.Interop
                     {
                         Dial(NameList.AIO_ADDNAME, pattern);
                     }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Updates accept timing for a connection in lifecycle tracking.
+        /// Called from LocalTcpProxy when accept() completes.
+        /// </summary>
+        internal static void UpdateAcceptTiming(ulong netFilterConnectionId, long acceptStartTime, long acceptEndTime)
+        {
+            if (_connectionLifecycle.TryGetValue(netFilterConnectionId, out var lifecycle))
+            {
+                lifecycle.AcceptStartTimestamp = acceptStartTime;
+                lifecycle.AcceptCompleteTimestamp = acceptEndTime;
+                
+                // Calculate timing gaps
+                var redirectToAcceptStart = (acceptStartTime - lifecycle.RedirectCompleteTimestamp) * 1000.0 / Stopwatch.Frequency;
+                var acceptWait = (acceptEndTime - acceptStartTime) * 1000.0 / Stopwatch.Frequency;
+                
+                // If Connected callback has fired, calculate that gap too
+                if (lifecycle.ConnectedTimestamp.HasValue)
+                {
+                    var connectedToAcceptStart = (acceptStartTime - lifecycle.ConnectedTimestamp.Value) * 1000.0 / Stopwatch.Frequency;
+                    Log.Debug("[ACCEPT-TIMING] ConnId={ConnectionId} Redirect→AcceptStart={RedirectToAcceptMs:F2}ms Connected→AcceptStart={ConnectedToAcceptMs:F2}ms AcceptWait={AcceptWaitMs:F2}ms",
+                        netFilterConnectionId, redirectToAcceptStart, connectedToAcceptStart, acceptWait);
+                }
+                else
+                {
+                    Log.Debug("[ACCEPT-TIMING] ConnId={ConnectionId} Redirect→AcceptStart={RedirectToAcceptMs:F2}ms AcceptWait={AcceptWaitMs:F2}ms (Connected not yet fired)",
+                        netFilterConnectionId, redirectToAcceptStart, acceptWait);
                 }
             }
         }

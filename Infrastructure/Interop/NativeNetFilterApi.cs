@@ -345,11 +345,57 @@ namespace OmniPoss.Infrastructure.Interop
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool nf_getProcessNameW(uint processId, [MarshalAs(UnmanagedType.LPWStr)] System.Text.StringBuilder buf, uint len);
 
-        // Helper methods
+        // Helper methods - Full WSA implementation
+        /// <summary>
+        /// Creates a sockaddr structure from IPAddress and port using WSA APIs for optimal performance.
+        /// Uses WSAStringToAddress for robust address conversion.
+        /// </summary>
         public static byte[] CreateSockAddr(IPAddress address, int port)
         {
             byte[] addrBytes = new byte[NF_MAX_ADDRESS_LENGTH];
 
+            try
+            {
+                // Use WSA API for address conversion (more robust and efficient)
+                string addressString = address.AddressFamily == AddressFamily.InterNetworkV6 
+                    ? $"[{address}]:{port}" 
+                    : $"{address}:{port}";
+                
+                int addressFamily = address.AddressFamily == AddressFamily.InterNetworkV6 ? AF_INET6 : AF_INET;
+                int addrLen = NF_MAX_ADDRESS_LENGTH;
+                
+                unsafe
+                {
+                    fixed (byte* addrPtr = addrBytes)
+                    {
+                        IntPtr sockaddrPtr = new IntPtr(addrPtr);
+                        int result = NativeMethods.WSAStringToAddressA(
+                            addressString,
+                            addressFamily,
+                            IntPtr.Zero,
+                            sockaddrPtr,
+                            ref addrLen);
+
+                        if (result == 0)
+                        {
+                            // Success - addrBytes now contains the sockaddr structure
+                            return addrBytes;
+                        }
+                        else
+                        {
+                            // WSA conversion failed, fall back to manual construction
+                            int error = NativeMethods.WSAGetLastError();
+                            System.Diagnostics.Debug.WriteLine($"[WSA] WSAStringToAddress failed: {error}, falling back to manual construction");
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to manual construction
+            }
+
+            // Fallback: Manual construction (original implementation)
             if (address.AddressFamily == AddressFamily.InterNetwork)
             {
                 // IPv4 sockaddr_in
