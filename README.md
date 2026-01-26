@@ -229,8 +229,9 @@ Right-click the OmniPoss tray icon to access:
 - **NF Run/Stop**: Start or stop the OmniPoss service (network filtering)
 - **Proxy Enable/Disable**: Configure Windows system-wide proxy
 - **Console Show/Hide**: Toggle console window visibility
-- **Cores**: Submenu to start/stop individual cores
+- **Cores**: Submenu to start/stop individual cores (with status indicators)
 - **Reload**: Hot-reload configuration from disk
+- **Start with Windows**: Toggle auto-start on system boot
 - **Open config folder**: Open `data/` folder in Explorer
 - **Open cores folder**: Open `data/cores/` folder in Explorer
 - **Exit**: Gracefully shutdown the application
@@ -259,12 +260,17 @@ OmniPoss supports hot-reloading configuration without restarting:
 **Note**: This is a RELOAD, not a RESTART. Services that are not running will not be started.
 
 **Hot-Reload Implementation**:
-- Reads actual running state before reload
-- Updates in-memory config objects (preserves references)
-- Only restarts services that are running AND have config changes
-- Relaunches all running cores (to pick up external config changes)
+- Reads actual running state before reload (what's actually running right now)
+- Reloads configuration from disk (`data/configs.json`)
+- Updates in-memory config objects (preserves object references for services)
+- Only restarts services that are running AND have config changes:
+  - **Cores**: Relaunches ALL currently running cores (configs managed externally, can't detect changes)
+  - **MainController**: Restarts if running AND config changed (SOCKS5 endpoint or NFConfig)
+  - **ProxyService**: Updates if enabled AND config changed
+- Updates tray menu status indicators as operations complete
 - Properly disposes and recreates proxy connections for seamless reload
 - Supports socket reuse to handle ports in TIME_WAIT state
+- Handles cancellation and errors gracefully, ensuring menu state reflects actual service state
 
 ### Bypass Rules
 
@@ -336,37 +342,46 @@ dotnet build -c Release
 
 ### Project Structure
 
-- `Program.cs`: Application entry point, UAC elevation, logging setup, DI container
+- `Program.cs`: Application entry point, UAC elevation, logging setup, DI container, startup shortcut management
 - `Core/`: Main business logic and application lifecycle
-  - `ApplicationHost.cs`: Central orchestrator, hot-reload, tray menu, graceful shutdown
+  - `ApplicationHost.cs`: Central orchestrator, hot-reload, tray menu, graceful shutdown, background task management
   - `MainController.cs`: Orchestrates SOCKS5 client and network filter controller
-  - `NetworkFilterController.cs`: Manages redirector configuration
+  - `NetworkFilterController.cs`: Manages redirector configuration and driver lifecycle
 - `Configuration/`: All configuration models
   - `ApplicationConfig.cs`: Root configuration container
-  - `NFConfig.cs`: Network filter configuration
+  - `NFConfig.cs`: Network filter configuration (nullable properties fall back to RedirectorConfig defaults)
   - `ProxyConfig.cs`: System proxy settings
   - `CoreConfig.cs`: Core process definition
+  - `RedirectorConfig.cs`: Default values for network filter redirector (used when NFConfig properties are null)
+- `Servers/`: Server configuration models
+  - `Socks5ClientConfig.cs`: SOCKS5 client endpoint configuration
 - `Infrastructure/`: Platform-specific code
   - `Drivers/NetworkFilterDriver.cs`: Driver installation and management
   - `Interop/NativeNetFilterApi.cs`: P/Invoke declarations for nfapi.dll
-  - `Process/CoreProcessManager.cs`: Process lifecycle management
+  - `Interop/NativeMethods.cs`: P/Invoke declarations for Windows APIs (DNS, WSA, user32, kernel32)
+  - `Process/CoreProcessManager.cs`: Process lifecycle management for external cores
   - `ServiceCollectionExtensions.cs`: DI service registration
 - `Services/`: Service layer
   - `Socks5ClientService.cs`: SOCKS5 client wrapper
   - `ProxyService.cs`: Windows registry-based proxy configuration
 - `Interop/`: Network proxy implementations and driver control
-  - `LocalTcpProxy.cs`: Local TCP proxy server (SOCKS5, configurable port, default 8888)
+  - `LocalTcpProxy.cs`: Local TCP proxy server (SOCKS5, configurable port, default 8888) using SocketAsyncEventArgs
   - `LocalUdpProxy.cs`: Local UDP proxy handler (SOCKS5 UDP ASSOCIATE)
-  - `Redirector.cs`: Pure C# implementation for driver control (uses nfapi.dll directly)
+  - `Redirector.cs`: Pure C# implementation for driver control (uses nfapi.dll directly via P/Invoke)
   - `ConsoleManager.cs`: Console window show/hide management
+  - `Socks5ConnectionHelper.cs`: SOCKS5 connection utilities
 - `UI/`: User interface components
-  - `Tray/TrayMenu.cs`: Context menu creation and state management
+  - `Tray/TrayMenu.cs`: Context menu creation and state management with status indicators
   - `ShutdownHandlerForm.cs`: Hidden form for Windows shutdown signal handling
 - `Utilities/`: Utility classes
   - `FirewallUtils.cs`: Windows Firewall rule management
   - `DnsUtils.cs`: DNS resolution utilities
   - `PortUtils.cs`: Port availability checking
   - `Socks5TestUtils.cs`: NAT type testing, HTTP connectivity tests
+  - `GeneralUtils.cs`: General utility functions
+- `Models/`: Data models
+  - `NatTypeTestResult.cs`: NAT type test result model
+  - `NumberRange.cs`: Number range utility model
 - `Storage/`: Native binaries and drivers (source files)
   - `v2.0/`: Current version (used in production)
   - `v1.0/`: Legacy version (kept for compatibility)
@@ -375,16 +390,19 @@ dotnet build -c Release
 
 **NuGet Packages**:
 - .NET 9.0
-- Microsoft.Extensions.DependencyInjection (v9.0.0)
-- Serilog (v4.1.0) - Structured logging
-- Serilog.Sinks.Console (v6.0.0) - Console logging
-- Serilog.Sinks.File (v6.0.0) - File logging
-- Newtonsoft.Json (v13.0.3) - Configuration serialization
+- Microsoft.Extensions.DependencyInjection (v9.0.0) - Dependency injection container
+- Serilog (v4.1.0) - Structured logging framework
+- Serilog.Extensions.Logging (v8.0.0) - Microsoft.Extensions.Logging integration
+- Serilog.Sinks.Console (v6.0.0) - Console logging sink
+- Serilog.Sinks.File (v6.0.0) - File logging sink with rolling
+- Newtonsoft.Json (v13.0.3) - JSON configuration serialization
 - Socks5 (v1.0.2) - SOCKS5 protocol support
 - Stun.Net (v9.0.0) - NAT type testing
-- WindowsFirewallHelper (v2.2.0.86) - Firewall rule management
-- Microsoft.Windows.CsWin32 (v0.3.183) - Windows API bindings
-- Microsoft.VisualStudio.Threading (v17.14.15) - Async utilities
+- WindowsFirewallHelper (v2.2.0.86) - Windows Firewall rule management
+- Microsoft.Windows.CsWin32 (v0.3.183) - Windows API bindings generator
+- Microsoft.VisualStudio.Threading (v17.14.15) - Async utilities and threading helpers
+- Microsoft.Diagnostics.Tracing.TraceEvent (v3.1.24) - Event tracing support
+- System.ServiceProcess.ServiceController (v9.0.8) - Windows service control
 
 **Native Components**:
 - **NetFilterSDK** (proprietary) - Kernel-mode network filter driver and native API
@@ -402,7 +420,10 @@ dotnet build -c Release
 - **Core Configuration**: Each core uses its own native configuration format (JSON, etc.)
 - **UDP Proxying**: Uses SOCKS5 UDP ASSOCIATE method for UDP traffic proxying through SOCKS5 relay
 - **Windows Shutdown**: Application handles Windows shutdown signals gracefully, ensuring proper cleanup of drivers, processes, and resources
-- **Auto-Start**: Release builds automatically create a startup shortcut in the Windows Startup folder
+- **Auto-Start**: Release builds automatically create/remove a startup shortcut in the Windows Startup folder based on `AutoStart` configuration setting
+- **Configuration Defaults**: If `data/configs.json` doesn't exist, a default configuration file is automatically created on first run
+- **Background Tasks**: Application tracks background tasks for proper cleanup during shutdown
+- **Menu Status Updates**: System tray menu status indicators are updated in real-time as services start/stop, including after hot-reload operations
 
 ## 🐛 Troubleshooting
 
@@ -433,6 +454,11 @@ dotnet build -c Release
 - Local TCP proxy listens on port 8888 by default (configurable via `NFConfig.LocalProxyPort`)
 - Ensure the configured port is not in use by another application
 - Port conflicts are automatically resolved during hot-reload (socket reuse enabled)
+
+### Hot-Reload Issues
+- If hot-reload fails, check `data/logs/omniposs-*.log` for detailed error messages
+- Menu status may not update immediately if background tasks fail - check logs for exceptions
+- Cores are always relaunched during hot-reload (to pick up external config changes), even if OmniPoss config didn't change
 
 ## 📄 License
 
