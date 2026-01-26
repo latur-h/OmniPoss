@@ -238,19 +238,7 @@ namespace OmniPoss.Interop
                     var isIPv6 = pConnInfo.ip_family == AF_INET6;
                     
                     // Extract port (needed for connection info storage)
-                    ushort extractedPort = 0;
-                    var localAddr = pConnInfo.localAddress;
-                    if (localAddr != null && localAddr.Length >= 4)
-                    {
-                        if (pConnInfo.ip_family == AF_INET)
-                        {
-                            extractedPort = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(localAddr, 2));
-                        }
-                        else if (pConnInfo.ip_family == AF_INET6)
-                        {
-                            extractedPort = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(localAddr, 2));
-                        }
-                    }
+                    ushort extractedPort = ExtractPort(pConnInfo.localAddress, pConnInfo.ip_family);
                     
                     // Save original addresses BEFORE modifying pConnInfo (copy directly to final arrays)
                     var originalRemoteAddr = new byte[NF_MAX_ADDRESS_LENGTH];
@@ -467,10 +455,12 @@ namespace OmniPoss.Interop
 
         /// <summary>
         /// Checks if the address is redirected to the local proxy (loopback + matching port).
+        /// Note: Caller should verify proxy initialization before calling this method.
         /// </summary>
         private static bool IsRedirectedToProxy(byte[] addressBytes, ushort addrFamily, ushort port)
         {
-            if (_tcpProxy == null || !_tcpProxy.IsInitialized || _udpProxy == null)
+            // Proxy state should be checked by caller to avoid repeated null checks
+            if (_tcpProxy == null || !_tcpProxy.IsInitialized)
                 return false;
 
             bool isLoopback = false;
@@ -708,16 +698,18 @@ namespace OmniPoss.Interop
                 ushort remotePort = 0;
                 bool isValidAddress = false;
 
+                // Cache proxy state to avoid repeated null checks
+                bool tcpProxyReady = _tcpProxy != null && _tcpProxy.IsInitialized;
+                bool udpProxyReady = _udpProxy != null;
+
                 if (addrFamily == AF_INET && remoteAddrBytes.Length >= 8)
                 {
-                    remotePort = BitConverter.ToUInt16(remoteAddrBytes, 2);
-                    remotePort = (ushort)IPAddress.NetworkToHostOrder((short)remotePort);
+                    remotePort = ExtractPort(remoteAddrBytes, addrFamily);
                     isValidAddress = true;
                 }
                 else if (addrFamily == AF_INET6 && remoteAddrBytes.Length >= 24)
                 {
-                    remotePort = BitConverter.ToUInt16(remoteAddrBytes, 2);
-                    remotePort = (ushort)IPAddress.NetworkToHostOrder((short)remotePort);
+                    remotePort = ExtractPort(remoteAddrBytes, addrFamily);
                     isValidAddress = true;
                 }
 
@@ -757,8 +749,8 @@ namespace OmniPoss.Interop
                     return;
                 }
 
-                // Check if redirected to proxy
-                bool isRedirectedToProxy = IsRedirectedToProxy(remoteAddrBytes, addrFamily, remotePort);
+                // Check if redirected to proxy (using cached proxy state)
+                bool isRedirectedToProxy = tcpProxyReady && udpProxyReady && IsRedirectedToProxy(remoteAddrBytes, addrFamily, remotePort);
 
                 // Redirect UDP connection to local proxy (if not already redirected)
                 if (!isRedirectedToProxy)
@@ -768,7 +760,7 @@ namespace OmniPoss.Interop
                         return;
                     }
                 }
-                else if (_udpProxy != null)
+                else if (udpProxyReady && _udpProxy != null)
                 {
                     // Already redirected - get original destination from stored map
                     // Note: remoteAddrBytes is now the redirected address (local proxy), not original
@@ -815,7 +807,10 @@ namespace OmniPoss.Interop
                 {
                     NativeNetFilterApi.nf_udpPostSend(id, remoteAddress, buf, len, options);
                 }
-                catch { }
+                catch (Exception fallbackEx)
+                {
+                    QueueLog(() => Log.Debug("[UDP] Error in fallback nf_udpPostSend: {Error}", fallbackEx.Message));
+                }
             }
         }
         /// <summary>
@@ -839,7 +834,12 @@ namespace OmniPoss.Interop
             if (ipHeader.Length < 10 || ipHeader[9] != IPPROTO_ICMP || _icmpDelay <= 0)
                 return false;
 
-            string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
+            // Include ICMP type and code in key for more accurate tracking
+            // ICMP type is at offset 0 of ICMP header (offset 20 from IP header start)
+            // ICMP code is at offset 1 of ICMP header
+            byte icmpType = ipHeader.Length >= 21 ? ipHeader[20] : (byte)0;
+            byte icmpCode = ipHeader.Length >= 22 ? ipHeader[21] : (byte)0;
+            string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}-{icmpType}-{icmpCode}";
 
             lock (_icmpDelayLock)
             {
@@ -926,6 +926,20 @@ namespace OmniPoss.Interop
         private const int IPPROTO_ICMP = 1;
         private const int NF_MAX_IP_ADDRESS_LENGTH = 16;
         private const int NF_MAX_ADDRESS_LENGTH = 28;
+
+        /// <summary>
+        /// Extracts port from address bytes (sockaddr format).
+        /// Works for both IPv4 and IPv6 (port is at offset 2 in both cases).
+        /// </summary>
+        private static ushort ExtractPort(byte[] addressBytes, ushort addrFamily)
+        {
+            if (addressBytes == null || addressBytes.Length < 4)
+                return 0;
+            
+            // Port is at offset 2 for both IPv4 and IPv6
+            ushort port = BitConverter.ToUInt16(addressBytes, 2);
+            return (ushort)IPAddress.NetworkToHostOrder((short)port);
+        }
 
         /// <summary>
         /// Checks if IPv4 address bytes represent a private IP address.
@@ -1864,7 +1878,7 @@ namespace OmniPoss.Interop
 
             _lastUdpCleanup = now;
             var cutoffTime = now - TimeSpan.FromMinutes(UdpEntryMaxAgeMinutes);
-            var keysToRemove = new List<ulong>();
+            var keysToRemove = new HashSet<ulong>();
 
             // Time-based cleanup: remove entries older than cutoff time
             foreach (var kvp in _udpOriginalDestinations)
@@ -1881,7 +1895,7 @@ namespace OmniPoss.Interop
                 var remainingToRemove = (_udpOriginalDestinations.Count - keysToRemove.Count) - UdpCleanupTargetEntries;
                 var sortedList = new List<(ulong Key, DateTime Timestamp)>();
                 
-                // Collect entries not already marked for removal
+                // Collect entries not already marked for removal (O(1) lookup with HashSet)
                 foreach (var kvp in _udpOriginalDestinations)
                 {
                     if (!keysToRemove.Contains(kvp.Key))
