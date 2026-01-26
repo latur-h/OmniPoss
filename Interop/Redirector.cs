@@ -11,7 +11,6 @@ using Serilog;
 using System.Globalization;
 using System.Threading;
 using System.Buffers;
-using System.Linq;
 using static OmniPoss.Infrastructure.Interop.NativeMethods;
 
 namespace OmniPoss.Interop
@@ -149,6 +148,7 @@ namespace OmniPoss.Interop
         private static readonly object _icmpDelayLock = new();
         private static DateTime _lastIcmpCleanup = DateTime.UtcNow;
         private const int IcmpCleanupIntervalMinutes = 10;
+        private const int IcmpEntryMaxAgeMinutes = 5;
 
         /// <summary>
         /// Thread start callback stub. Provides valid function pointer for NetFilter SDK.
@@ -658,20 +658,38 @@ namespace OmniPoss.Interop
             }
 
             // Fallback: Manual parsing (original implementation)
-            if (addrFamily == AF_INET && addressBytes.Length >= 8)
+            if (addrFamily == AF_INET)
             {
+                if (addressBytes.Length < 8)
+                    return null;
+                
                 ushort port = BitConverter.ToUInt16(addressBytes, 2);
                 port = (ushort)IPAddress.NetworkToHostOrder((short)port);
                 uint ipAddr = BitConverter.ToUInt32(addressBytes, 4);
-                return new IPEndPoint(new IPAddress(BitConverter.GetBytes(ipAddr)), port);
+                var ip = new IPAddress(BitConverter.GetBytes(ipAddr));
+                
+                // Validate address family matches
+                if (ip.AddressFamily != AddressFamily.InterNetwork)
+                    return null;
+                
+                return new IPEndPoint(ip, port);
             }
-            else if (addrFamily == AF_INET6 && addressBytes.Length >= 24)
+            else if (addrFamily == AF_INET6)
             {
+                if (addressBytes.Length < 24)
+                    return null;
+                
                 ushort port = BitConverter.ToUInt16(addressBytes, 2);
                 port = (ushort)IPAddress.NetworkToHostOrder((short)port);
                 byte[] ipAddrBytes = new byte[16];
                 Array.Copy(addressBytes, 8, ipAddrBytes, 0, 16);
-                return new IPEndPoint(new IPAddress(ipAddrBytes), port);
+                var ip = new IPAddress(ipAddrBytes);
+                
+                // Validate address family matches
+                if (ip.AddressFamily != AddressFamily.InterNetworkV6)
+                    return null;
+                
+                return new IPEndPoint(ip, port);
             }
             return null;
         }
@@ -813,6 +831,32 @@ namespace OmniPoss.Interop
         private static void StubUdpCanSend(ulong id) { }
 
         /// <summary>
+        /// Checks if an ICMP packet should be delayed based on delay configuration.
+        /// Returns true if packet should be dropped (delayed), false if it should be processed.
+        /// </summary>
+        private static bool ShouldDelayIcmpPacket(byte[] ipHeader)
+        {
+            if (ipHeader.Length < 10 || ipHeader[9] != IPPROTO_ICMP || _icmpDelay <= 0)
+                return false;
+
+            string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
+
+            lock (_icmpDelayLock)
+            {
+                if (_icmpPacketTimes.TryGetValue(packetKey, out var lastTime))
+                {
+                    var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
+                    if (elapsed < _icmpDelay)
+                    {
+                        return true; // Delay this packet
+                    }
+                }
+                _icmpPacketTimes[packetKey] = DateTime.UtcNow;
+            }
+            return false; // Process this packet
+        }
+
+        /// <summary>
         /// IP receive callback. Handles ICMP packets with delay support and posts them back to the stack.
         /// </summary>
         /// <param name="buf">Pointer to IP packet buffer.</param>
@@ -828,26 +872,8 @@ namespace OmniPoss.Interop
                 byte[] ipHeader = new byte[Math.Min(20, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
-                if (ipHeader.Length >= 10 && ipHeader[9] == IPPROTO_ICMP)
-                {
-                    string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
-
-                    if (_icmpDelay > 0)
-                    {
-                        lock (_icmpDelayLock)
-                        {
-                            if (_icmpPacketTimes.TryGetValue(packetKey, out var lastTime))
-                            {
-                                var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
-                                if (elapsed < _icmpDelay)
-                                {
-                                    return;
-                                }
-                            }
-                            _icmpPacketTimes[packetKey] = DateTime.UtcNow;
-                        }
-                    }
-                }
+                if (ShouldDelayIcmpPacket(ipHeader))
+                    return;
 
                 NativeNetFilterApi.nf_ipPostReceive(buf, len, options);
             }
@@ -873,26 +899,8 @@ namespace OmniPoss.Interop
                 byte[] ipHeader = new byte[Math.Min(20, len)];
                 Marshal.Copy(buf, ipHeader, 0, ipHeader.Length);
 
-                if (ipHeader.Length >= 10 && ipHeader[9] == IPPROTO_ICMP)
-                {
-                    string packetKey = $"{BitConverter.ToUInt32(ipHeader, 12)}-{BitConverter.ToUInt32(ipHeader, 16)}";
-
-                    if (_icmpDelay > 0)
-                    {
-                        lock (_icmpDelayLock)
-                        {
-                            if (_icmpPacketTimes.TryGetValue(packetKey, out var lastTime))
-                            {
-                                var elapsed = (DateTime.UtcNow - lastTime).TotalMilliseconds;
-                                if (elapsed < _icmpDelay)
-                                {
-                                    return;
-                                }
-                            }
-                            _icmpPacketTimes[packetKey] = DateTime.UtcNow;
-                        }
-                    }
-                }
+                if (ShouldDelayIcmpPacket(ipHeader))
+                    return;
 
                 NativeNetFilterApi.nf_ipPostSend(buf, len, options);
             }
@@ -1824,7 +1832,7 @@ namespace OmniPoss.Interop
 
                 _lastIcmpCleanup = now;
 
-                var cutoffTime = now - TimeSpan.FromMinutes(5);
+                var cutoffTime = now - TimeSpan.FromMinutes(IcmpEntryMaxAgeMinutes);
                 var keysToRemove = new List<string>();
 
                 foreach (var kvp in _icmpPacketTimes)
@@ -1871,13 +1879,25 @@ namespace OmniPoss.Interop
             if (_udpOriginalDestinations.Count - keysToRemove.Count > UdpCleanupTargetEntries)
             {
                 var remainingToRemove = (_udpOriginalDestinations.Count - keysToRemove.Count) - UdpCleanupTargetEntries;
-                var sortedEntries = _udpOriginalDestinations
-                    .Where(kvp => !keysToRemove.Contains(kvp.Key))
-                    .OrderBy(kvp => kvp.Value.Timestamp)
-                    .Take(remainingToRemove)
-                    .Select(kvp => kvp.Key);
+                var sortedList = new List<(ulong Key, DateTime Timestamp)>();
                 
-                keysToRemove.AddRange(sortedEntries);
+                // Collect entries not already marked for removal
+                foreach (var kvp in _udpOriginalDestinations)
+                {
+                    if (!keysToRemove.Contains(kvp.Key))
+                    {
+                        sortedList.Add((kvp.Key, kvp.Value.Timestamp));
+                    }
+                }
+                
+                // Sort by timestamp (oldest first)
+                sortedList.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+                
+                // Add oldest entries to removal list
+                for (int i = 0; i < remainingToRemove && i < sortedList.Count; i++)
+                {
+                    keysToRemove.Add(sortedList[i].Key);
+                }
             }
 
             foreach (var key in keysToRemove)
@@ -2009,7 +2029,10 @@ namespace OmniPoss.Interop
                 {
                     _logProcessorTask?.Wait(TimeSpan.FromSeconds(2));
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    try { Log.Debug("[LOG-PROCESSOR] Error waiting for log processor to stop: {Error}", ex.Message); } catch { }
+                }
                 _logProcessorTask = null;
             }
         }
