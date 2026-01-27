@@ -471,8 +471,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 OmniPoss was originally created to support the **TUIC protocol**, which was unsupported by all proxy clients at the time. The architecture enables support for any protocol that proxy cores support, making it future-proof and highly flexible.
 
 This project uses **NetFilterSDK** by Vitaly Sidorov for kernel-mode network traffic interception. NetFilterSDK is proprietary software - for licensing information, please visit [netfiltersdk.com](https://www.netfiltersdk.com/).
-
-## 📚 Additional Documentation
-
-- [AI Context](Documents/AI_CONTEXT.md) - Detailed technical documentation for developers
-- [Deployment Guide](Documents/Deploy.md) - Deployment and installation instructions
