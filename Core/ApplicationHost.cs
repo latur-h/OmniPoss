@@ -181,9 +181,18 @@ namespace OmniPoss.Core
                 exitItem.Click += (s, e) => _ = ExitApplicationAsync();
             }
 
-            // Attach core toggle handlers
+            // Attach core toggle handlers and refresh indicators when Cores submenu opens
             if (trayMenu.Items["Cores"] is ToolStripMenuItem coresItem)
             {
+                coresItem.DropDownOpening += (s, e) =>
+                {
+                    foreach (ToolStripMenuItem item in coresItem.DropDownItems.OfType<ToolStripMenuItem>())
+                    {
+                        string? key = item.Name;
+                        if (!string.IsNullOrEmpty(key))
+                            _trayMenu.ToggleCore(key, _coreManager.IsRunning(key));
+                    }
+                };
                 foreach (ToolStripMenuItem item in coresItem.DropDownItems.OfType<ToolStripMenuItem>())
                 {
                     string? key = item.Name;
