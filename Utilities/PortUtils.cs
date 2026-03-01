@@ -5,8 +5,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using Windows.Win32;
-using Windows.Win32.NetworkManagement.IpHelper;
+using OmniPoss.Infrastructure.Interop;
 
 namespace OmniPoss.Utilities
 {
@@ -49,28 +48,33 @@ namespace OmniPoss.Utilities
                 case AddressFamily.InterNetwork:
                     {
                         var process = new List<Process>();
-                        unsafe
+                        uint size = 0;
+                        NativeMethods.GetExtendedTcpTable(IntPtr.Zero, ref size, false, (uint)inet, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER, 0);
+                        var buffer = Marshal.AllocHGlobal((int)size);
+                        try
                         {
-                            uint err;
-                            uint size = 0;
-                            PInvoke.GetExtendedTcpTable(default, ref size, false, (uint)inet, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER, 0); // get size
-                            var tcpTable = (MIB_TCPTABLE_OWNER_PID*)Marshal.AllocHGlobal((int)size);
-
-                            if ((err = PInvoke.GetExtendedTcpTable(tcpTable, ref size, false, (uint)inet, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER, 0)) != 0)
+                            var err = NativeMethods.GetExtendedTcpTable(buffer, ref size, false, (uint)inet, TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER, 0);
+                            if (err != 0)
                                 throw new Win32Exception((int)err);
 
-                            for (var i = 0; i < tcpTable->dwNumEntries; i++)
+                            var numEntries = (uint)Marshal.ReadInt32(buffer, 0);
+                            var rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+                            for (var i = 0; i < numEntries; i++)
                             {
-                                var row = tcpTable->table[i];
+                                var rowPtr = IntPtr.Add(buffer, 4 + i * rowSize);
+                                var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
 
                                 if (row.dwOwningPid is 0 or 4)
                                     continue;
 
-                                // Use IPAddress.NetworkToHostOrder for compatibility (ntohs requires Windows 8.1+)
                                 var localPort = (ushort)IPAddress.NetworkToHostOrder((short)row.dwLocalPort);
                                 if (localPort == port)
                                     process.Add(Process.GetProcessById((int)row.dwOwningPid));
                             }
+                        }
+                        finally
+                        {
+                            Marshal.FreeHGlobal(buffer);
                         }
 
                         return process;

@@ -2,8 +2,38 @@ using System.Runtime.InteropServices;
 
 namespace OmniPoss.Infrastructure.Interop
 {
+    internal enum TCP_TABLE_CLASS
+    {
+        TCP_TABLE_BASIC_LISTENER = 0,
+        TCP_TABLE_BASIC_CONNECTIONS = 1,
+        TCP_TABLE_BASIC_ALL = 2,
+        TCP_TABLE_OWNER_PID_LISTENER = 3,
+        TCP_TABLE_OWNER_PID_CONNECTIONS = 4,
+        TCP_TABLE_OWNER_PID_ALL = 5,
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MIB_TCPROW_OWNER_PID
+    {
+        public uint dwState;
+        public uint dwLocalAddr;
+        public uint dwLocalPort;
+        public uint dwRemoteAddr;
+        public uint dwRemotePort;
+        public uint dwOwningPid;
+    }
+
     internal static partial class NativeMethods
     {
+        [DllImport("iphlpapi.dll", SetLastError = false)]
+        internal static extern uint GetExtendedTcpTable(
+            IntPtr pTcpTable,
+            ref uint pdwOutBufLen,
+            [MarshalAs(UnmanagedType.Bool)] bool sort,
+            uint ulAf,
+            TCP_TABLE_CLASS tableClass,
+            uint reserved);
+
         [LibraryImport("dnsapi", EntryPoint = "DnsFlushResolverCache")]
         internal static partial uint RefreshDNSCache();
 
