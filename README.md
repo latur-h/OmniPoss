@@ -41,11 +41,11 @@ OmniPoss follows a **"SOCKS5-only frontend, core-agnostic backend"** pattern:
 - **OS**: Windows 10.0.17763.0 or later
 - **Architecture**: x64 or ARM64
 - **Privileges**: Administrator (required for driver installation and network interception)
-- **.NET**: 9.0 runtime
+- **.NET**: 10.0 runtime
 
 ## 🔧 Technology Stack
 
-- **Framework**: .NET 9.0 (Windows-specific: `net9.0-windows10.0.17763.0`)
+- **Framework**: .NET 10.0 (Windows-specific: `net10.0-windows10.0.17763.0`)
 - **UI**: Windows Forms (for system tray)
 - **Configuration**: JSON (using Newtonsoft.Json)
 - **Dependency Injection**: Microsoft.Extensions.DependencyInjection
@@ -55,7 +55,6 @@ OmniPoss follows a **"SOCKS5-only frontend, core-agnostic backend"** pattern:
   - `Socks5` (v1.0.2) - SOCKS5 protocol support
   - `Stun.Net` (v9.0.0) - NAT type testing
   - `WindowsFirewallHelper` (v2.2.0.86) - Firewall rule management
-  - `Microsoft.Windows.CsWin32` - Windows API bindings
   - `Serilog` (v4.1.0) - Structured logging
 
 ## 🚀 Quick Start
@@ -389,20 +388,17 @@ dotnet build -c Release
 ### Dependencies
 
 **NuGet Packages**:
-- .NET 9.0
+- .NET 10.0
 - Microsoft.Extensions.DependencyInjection (v9.0.0) - Dependency injection container
+- Newtonsoft.Json (v13.0.3) - JSON configuration serialization
 - Serilog (v4.1.0) - Structured logging framework
 - Serilog.Extensions.Logging (v8.0.0) - Microsoft.Extensions.Logging integration
 - Serilog.Sinks.Console (v6.0.0) - Console logging sink
 - Serilog.Sinks.File (v6.0.0) - File logging sink with rolling
-- Newtonsoft.Json (v13.0.3) - JSON configuration serialization
 - Socks5 (v1.0.2) - SOCKS5 protocol support
 - Stun.Net (v9.0.0) - NAT type testing
-- WindowsFirewallHelper (v2.2.0.86) - Windows Firewall rule management
-- Microsoft.Windows.CsWin32 (v0.3.183) - Windows API bindings generator
-- Microsoft.VisualStudio.Threading (v17.14.15) - Async utilities and threading helpers
-- Microsoft.Diagnostics.Tracing.TraceEvent (v3.1.24) - Event tracing support
 - System.ServiceProcess.ServiceController (v9.0.8) - Windows service control
+- WindowsFirewallHelper (v2.2.0.86) - Windows Firewall rule management
 
 **Native Components**:
 - **NetFilterSDK** (proprietary) - Kernel-mode network filter driver and native API
@@ -434,7 +430,7 @@ dotnet build -c Release
 
 ### Core Not Starting
 - Check `data/logs/omniposs-*.log` for errors
-- Verify core executable path in `configs.json`
+- Verify core executable path in `data/configs.json`
 - Ensure core's config file exists and is valid
 - Check console output (toggle via tray menu)
 
